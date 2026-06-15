@@ -337,17 +337,15 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # Загружаем фото на Drive
+    # Получаем ссылки на фото через Telegram
     photo_urls = []
     for i, file_id in enumerate(context.user_data.get("photos", []), 1):
         try:
             file = await context.bot.get_file(file_id)
-            file_bytes = await file.download_as_bytearray()
-            filename = f"{visit_id}_photo_{i}.jpg"
-            url = upload_photo_to_drive(bytes(file_bytes), filename)
+            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
             photo_urls.append(url)
         except Exception as e:
-            logger.error(f"Ошибка загрузки фото: {e}")
+            logger.error(f"Ошибка получения фото: {e}")
 
     context.user_data["photo_url"] = " | ".join(photo_urls) if photo_urls else "нет фото"
 
