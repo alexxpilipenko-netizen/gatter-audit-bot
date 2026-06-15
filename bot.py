@@ -2,7 +2,6 @@ import logging
 import os
 import json
 import io
-import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -96,28 +95,28 @@ def save_to_sheet(data: dict):
         data.get("photo_url", ""),
     ])
 
-IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID")
 
-def upload_photo_to_imgur(file_bytes: bytes) -> str:
-    """Загружает фото на Imgur, возвращает прямую ссылку или '' при ошибке."""
-    if not IMGUR_CLIENT_ID:
-        logger.error("IMGUR_CLIENT_ID не задан")
+def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
+    """Загружает фото в папку Google Drive, возвращает ссылку или '' при ошибке."""
+    if not DRIVE_FOLDER_ID:
+        logger.error("DRIVE_FOLDER_ID не задан")
         return ""
     try:
-        resp = requests.post(
-            "https://api.imgur.com/3/image",
-            headers={"Authorization": f"Client-ID {IMGUR_CLIENT_ID}"},
-            files={"image": file_bytes},
-            data={"type": "file"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()["data"]["link"]
+        creds = get_google_creds()
+        service = build("drive", "v3", credentials=creds)
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
+        file = service.files().create(
+            body={"name": filename, "parents": [DRIVE_FOLDER_ID]},
+            media_body=media,
+            fields="id",
+        ).execute()
+        file_id = file.get("id")
+        return f"https://drive.google.com/uc?id={file_id}"
     except Exception as e:
-        logger.error(f"Ошибка загрузки на Imgur: {e}")
+        logger.error(f"Ошибка загрузки на Drive: {e}")
         return ""
 
-   
+
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
 def is_authorized(user_id: int) -> bool:
     return user_id in AUTHORIZED_USERS
@@ -343,19 +342,21 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-# Скачиваем фото из Telegram и заливаем на Imgur
+    # Скачиваем фото из Telegram и заливаем на Google Drive
     photo_urls = []
-    for file_id in context.user_data.get("photos", []):
+    for i, file_id in enumerate(context.user_data.get("photos", []), 1):
         try:
             tg_file = await context.bot.get_file(file_id)
             file_bytes = bytes(await tg_file.download_as_bytearray())
-            link = upload_photo_to_imgur(file_bytes)
+            filename = f"{visit_id}_{i}.jpg"
+            link = upload_photo_to_drive(file_bytes, filename)
             if link:
                 photo_urls.append(link)
         except Exception as e:
             logger.error(f"Ошибка обработки фото: {e}")
 
     context.user_data["photo_url"] = ", ".join(photo_urls)
+
     # Сохраняем в Google Sheets
     try:
         save_to_sheet(context.user_data)
