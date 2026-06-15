@@ -97,21 +97,8 @@ def save_to_sheet(data: dict):
 
 
 def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
-    creds = get_google_creds()
-    service = build("drive", "v3", credentials=creds)
-    file_metadata = {"name": filename, "parents": [DRIVE_FOLDER_ID]}
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
-    uploaded = service.files().create(
-        body=file_metadata, media_body=media, fields="id"
-    ).execute()
-    file_id = uploaded.get("id")
-    service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"}
-    ).execute()
-    return f"https://drive.google.com/file/d/{file_id}/view"
-
-
+    return "фото временно недоступно"
+   
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
 def is_authorized(user_id: int) -> bool:
     return user_id in AUTHORIZED_USERS
