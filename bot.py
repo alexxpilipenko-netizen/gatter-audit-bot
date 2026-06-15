@@ -346,9 +346,6 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo_urls.append(url)
         except Exception as e:
             logger.error(f"Ошибка получения фото: {e}")
-
-    context.user_data["photo_url"] = " | ".join(photo_urls) if photo_urls else "нет фото"
-
     # Сохраняем в Google Sheets
     try:
         save_to_sheet(context.user_data)
