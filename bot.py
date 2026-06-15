@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import io
+import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -95,9 +96,27 @@ def save_to_sheet(data: dict):
         data.get("photo_url", ""),
     ])
 
+IMGUR_CLIENT_ID = os.environ.get("IMGUR_CLIENT_ID")
 
-def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
-    return "фото временно недоступно"
+def upload_photo_to_imgur(file_bytes: bytes) -> str:
+    """Загружает фото на Imgur, возвращает прямую ссылку или '' при ошибке."""
+    if not IMGUR_CLIENT_ID:
+        logger.error("IMGUR_CLIENT_ID не задан")
+        return ""
+    try:
+        resp = requests.post(
+            "https://api.imgur.com/3/image",
+            headers={"Authorization": f"Client-ID {IMGUR_CLIENT_ID}"},
+            files={"image": file_bytes},
+            data={"type": "file"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["data"]["link"]
+    except Exception as e:
+        logger.error(f"Ошибка загрузки на Imgur: {e}")
+        return ""
+
    
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
 def is_authorized(user_id: int) -> bool:
@@ -324,15 +343,19 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # Получаем ссылки на фото через Telegram
+# Скачиваем фото из Telegram и заливаем на Imgur
     photo_urls = []
-    for i, file_id in enumerate(context.user_data.get("photos", []), 1):
+    for file_id in context.user_data.get("photos", []):
         try:
-            file = await context.bot.get_file(file_id)
-            url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-            photo_urls.append(url)
+            tg_file = await context.bot.get_file(file_id)
+            file_bytes = bytes(await tg_file.download_as_bytearray())
+            link = upload_photo_to_imgur(file_bytes)
+            if link:
+                photo_urls.append(link)
         except Exception as e:
-            logger.error(f"Ошибка получения фото: {e}")
+            logger.error(f"Ошибка обработки фото: {e}")
+
+    context.user_data["photo_url"] = ", ".join(photo_urls)
     # Сохраняем в Google Sheets
     try:
         save_to_sheet(context.user_data)
