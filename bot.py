@@ -24,11 +24,9 @@ YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER", "Gatter Audit")
 
 # Авторизованные пользователи: {telegram_user_id: "Имя"}
 AUTHORIZED_USERS = {
-   
     244836501: "Александр Пилипенко",
-    1099924202: "Олеся Ковтун", 
+    1099924202: "Олеся Ковтун",
     8351444988: "Мой Узбекский",
-    
 }
 
 BRANDS = {
@@ -158,6 +156,11 @@ def is_authorized(user_id: int) -> bool:
 # ─── HANDLERS ───────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    # ДИАГНОСТИКА: пишем в лог, чей ID пришёл и какой список загружен
+    logger.info(f"START от user_id={user_id} (тип {type(user_id).__name__}); "
+                f"список разрешённых={list(AUTHORIZED_USERS.keys())}; "
+                f"пускаем={user_id in AUTHORIZED_USERS}")
+
     if not is_authorized(user_id):
         await update.message.reply_text(
             f"⛔ У вас нет доступа к этому боту.\n"
