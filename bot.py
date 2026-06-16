@@ -25,6 +25,7 @@ YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER", "Gatter Audit")
 # Авторизованные пользователи: {telegram_user_id: "Имя"}
 AUTHORIZED_USERS = {
     244836501: "Александр Пилипенко",
+    1099924202: "Олеся Ковтун",
 }
 
 BRANDS = {
