@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import io
+import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -10,8 +11,6 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,8 +18,9 @@ logger = logging.getLogger(__name__)
 # ─── КОНФИГУРАЦИЯ ───────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SHEET_ID = os.environ.get("SHEET_ID")
-DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
+YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
+YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER", "Gatter Audit")
 
 # Авторизованные пользователи: {telegram_user_id: "Имя"}
 AUTHORIZED_USERS = {
@@ -56,7 +56,6 @@ def get_google_creds():
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
     ]
     return Credentials.from_service_account_info(creds_info, scopes=scopes)
 
@@ -96,24 +95,54 @@ def save_to_sheet(data: dict):
     ])
 
 
-def upload_photo_to_drive(file_bytes: bytes, filename: str) -> str:
-    """Загружает фото в папку Google Drive, возвращает ссылку или '' при ошибке."""
-    if not DRIVE_FOLDER_ID:
-        logger.error("DRIVE_FOLDER_ID не задан")
+# ─── ЯНДЕКС.ДИСК ────────────────────────────────────────────────────────────
+def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
+    """Загружает фото на Яндекс.Диск, публикует его и возвращает публичную ссылку.
+    При любой ошибке возвращает ''."""
+    if not YANDEX_TOKEN:
+        logger.error("YANDEX_TOKEN не задан")
         return ""
+
+    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+    disk_path = f"{YANDEX_FOLDER}/{filename}"
+    base = "https://cloud-api.yandex.net/v1/disk/resources"
+
     try:
-        creds = get_google_creds()
-        service = build("drive", "v3", credentials=creds)
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype="image/jpeg")
-        file = service.files().create(
-            body={"name": filename, "parents": [DRIVE_FOLDER_ID]},
-            media_body=media,
-            fields="id",
-        ).execute()
-        file_id = file.get("id")
-        return f"https://drive.google.com/uc?id={file_id}"
+        # 1. Получаем ссылку для загрузки
+        r = requests.get(
+            f"{base}/upload",
+            headers=headers,
+            params={"path": disk_path, "overwrite": "true"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        href = r.json()["href"]
+
+        # 2. Загружаем байты файла
+        up = requests.put(href, data=file_bytes, timeout=60)
+        up.raise_for_status()
+
+        # 3. Публикуем файл
+        requests.put(
+            f"{base}/publish",
+            headers=headers,
+            params={"path": disk_path},
+            timeout=30,
+        )
+
+        # 4. Получаем публичную ссылку
+        meta = requests.get(
+            base,
+            headers=headers,
+            params={"path": disk_path, "fields": "public_url"},
+            timeout=30,
+        )
+        meta.raise_for_status()
+        public_url = meta.json().get("public_url", "")
+        return public_url
+
     except Exception as e:
-        logger.error(f"Ошибка загрузки на Drive: {e}")
+        logger.error(f"Ошибка загрузки на Яндекс.Диск: {e}")
         return ""
 
 
@@ -342,14 +371,14 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # Скачиваем фото из Telegram и заливаем на Google Drive
+    # Скачиваем фото из Telegram и заливаем на Яндекс.Диск
     photo_urls = []
     for i, file_id in enumerate(context.user_data.get("photos", []), 1):
         try:
             tg_file = await context.bot.get_file(file_id)
             file_bytes = bytes(await tg_file.download_as_bytearray())
             filename = f"{visit_id}_{i}.jpg"
-            link = upload_photo_to_drive(file_bytes, filename)
+            link = upload_photo_to_yandex(file_bytes, filename)
             if link:
                 photo_urls.append(link)
         except Exception as e:
