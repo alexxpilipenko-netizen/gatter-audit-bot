@@ -22,12 +22,25 @@ GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON")
 YANDEX_TOKEN = os.environ.get("YANDEX_TOKEN")
 YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER", "Gatter Audit")
 
-# Авторизованные пользователи: {telegram_user_id: "Имя"}
-AUTHORIZED_USERS = {
-    244836501: "Александр Пилипенко",
-    1099924202: "Олеся Ковтун",
-    8351444988: "Мой Узбекский",
-}
+# Список разрешённых пользователей берётся из переменной окружения ALLOWED_USER_IDS.
+# Формат: Telegram ID через запятую, например:
+#   ALLOWED_USER_IDS = 244836501,1099924202,8351444988
+# Чтобы добавить/убрать человека — поменяй эту переменную в Railway → Variables
+# (бот перезапустится автоматически). Имя аудитора берётся из его Telegram-профиля.
+def parse_allowed_ids(raw: str) -> set:
+    ids = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning(f"ALLOWED_USER_IDS: пропущен нечисловой элемент {part!r}")
+    return ids
+
+
+ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 BRANDS = {
     "Ferrero": ["Nutella", "Ferrero Rocher", "Raffaello", "Kinder", "Tic Tac"],
@@ -97,7 +110,6 @@ def save_to_sheet(data: dict):
         ws = sh.add_worksheet(title="Аудит", rows=2000, cols=20)
         ws.append_row(SHEET_HEADER)
 
-    # Общие поля визита (повторяются в каждой строке)
     common = [
         data.get("visit_id", ""),
         data.get("date", ""),
@@ -110,19 +122,17 @@ def save_to_sheet(data: dict):
         data.get("tt_format", ""),
     ]
 
-    brand_sku = data.get("brand_sku", [])  # список кортежей (бренд, sku)
+    brand_sku = data.get("brand_sku", [])
     notes = data.get("notes", "")
     photo_url = data.get("photo_url", "")
 
     rows = []
     if not brand_sku:
-        # Нет наших брендов — одна строка с пометкой
         rows.append(common + ["Нет наших брендов", "0", notes, photo_url])
     else:
         for brand, sku in brand_sku:
             rows.append(common + [brand, sku, notes, photo_url])
 
-    # append_rows — пишет все строки одним запросом
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
@@ -175,15 +185,16 @@ def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
 
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
 def is_authorized(user_id: int) -> bool:
-    return user_id in AUTHORIZED_USERS
+    return user_id in ALLOWED_USER_IDS
 
 
 # ─── HANDLERS ───────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    logger.info(f"START от user_id={user_id} (тип {type(user_id).__name__}); "
-                f"список разрешённых={list(AUTHORIZED_USERS.keys())}; "
-                f"пускаем={user_id in AUTHORIZED_USERS}")
+    user = update.effective_user
+    user_id = user.id
+    logger.info(f"START от user_id={user_id}; "
+                f"разрешённые={sorted(ALLOWED_USER_IDS)}; "
+                f"пускаем={user_id in ALLOWED_USER_IDS}")
 
     if not is_authorized(user_id):
         await update.message.reply_text(
@@ -194,7 +205,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    name = AUTHORIZED_USERS[user_id]
+    # Имя аудитора берём из Telegram-профиля
+    name = user.full_name or "Аудитор"
     context.user_data.clear()
     context.user_data["auditor"] = name
     context.user_data["photos"] = []
@@ -252,7 +264,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["lat"] = loc.latitude
     context.user_data["lon"] = loc.longitude
 
-    # Показываем описания форматов и кнопки выбора
     descriptions = "\n\n".join(TT_FORMATS.values())
     keyboard = [["AA+", "AA", "A"], ["B", "C", "D"]]
     await update.message.reply_text(
@@ -294,7 +305,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
-    # Инициализируем хранилище пар (бренд, sku)
     context.user_data["brand_sku"] = []
     context.user_data["selected_brands"] = []
 
@@ -315,7 +325,6 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
 
-    # Нет наших брендов — сразу к заметкам, brand_sku остаётся пустым
     if text == NO_BRANDS_LABEL:
         context.user_data["brand_sku"] = []
         return await ask_notes(update, context)
@@ -334,7 +343,6 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in context.user_data["selected_brands"]:
             await update.message.reply_text(f"⚠️ {text} уже добавлен. Выбери другой бренд.")
             return BRANDS_SELECT
-        # Запоминаем, какой бренд сейчас вводим, и просим число SKU
         context.user_data["current_brand"] = text
         await update.message.reply_text(
             f"🔢 Сколько SKU бренда *{text}* в точке? Впиши число:",
@@ -343,7 +351,6 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return SKU_INPUT
 
-    # Любой другой текст
     await update.message.reply_text("Выбери бренд из кнопок или нажми «Выбор завершён».")
     return BRANDS_SELECT
 
@@ -357,7 +364,6 @@ async def sku_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
-    # Оставляем в клавиатуре только ещё не выбранные бренды
     remaining = [b for b in brand_list if b not in context.user_data["selected_brands"]]
     keyboard = [[b] for b in remaining] + [["✅ Выбор завершён"]]
 
@@ -390,7 +396,6 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # Скачиваем фото из Telegram и заливаем на Яндекс.Диск
     photo_urls = []
     for i, file_id in enumerate(context.user_data.get("photos", []), 1):
         try:
@@ -405,7 +410,6 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["photo_url"] = ", ".join(photo_urls)
 
-    # Сохраняем в Google Sheets
     try:
         save_to_sheet(context.user_data)
     except Exception as e:
@@ -413,7 +417,6 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка сохранения. Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Формируем сводку по брендам
     brand_sku = context.user_data.get("brand_sku", [])
     if brand_sku:
         brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
