@@ -40,17 +40,32 @@ CITIES = [
     "Ургенч", "Коканд", "Наманган", "Джиззак", "Карши", "Навои"
 ]
 
-RATINGS = {
-    "1": "1 — Очень плохо: товар почти отсутствует, полка пустая или занята конкурентами",
-    "2": "2 — Плохо: товар есть, но мало, расположен неудобно, конкуренты представлены лучше",
-    "3": "3 — Нормально: товар есть, но ничего особенного, средняя полка",
-    "4": "4 — Хорошо: товар хорошо виден, полка аккуратная, смотрится лучше конкурентов",
-    "5": "5 — Отлично: товар на лучшем месте, идеальная полка, сразу бросается в глаза",
+# Форматы торговых точек (тиры) с краткими описаниями
+TT_FORMATS = {
+    "AA+": "AA+ — Супермаркет L / Гипермаркет (Korzinka, Makro, Smart и аналоги). "
+           "Самообслуживание, от 1000 м². Полная выкладка по всем категориям, "
+           "оборудование на кассе, POS-материалы. Приоритет — 100% наличие на полках.",
+    "AA": "AA — Супермаркет Medium. Самообслуживание, 600–1000 м². "
+          "Полная выкладка по всем категориям, оборудование на кассе, POS-материалы. "
+          "Приоритет — 100% наличие на полках.",
+    "A": "A — Супермаркет Small / Минимаркет. Самообслуживание, 100–600 м². "
+         "Фокус на ключевых SKU. Контроль ценников и сроков годности.",
+    "B": "B — Food store / Павильон Big. Небольшой прилавочный магазин или "
+         "базарный павильон, от 30 м². Поддержание MML по ключевым брендам, "
+         "своевременный дозаказ.",
+    "C": "C — Павильон Small / Ларёк. Киоск или малый прилавок, до 30 м². "
+         "Ограниченный ассортимент, фокус на быстрооборачиваемых позициях. "
+         "Строгий минимум MML.",
+    "D": "D — Точка минимального присутствия. Малый киоск, уличная или удалённая "
+         "точка. Очень ограниченная полочная ёмкость. Только базовый MML, "
+         "регулярность посещения важнее расширения ассортимента.",
 }
 
+NO_BRANDS_LABEL = "❌ Нет наших брендов"
+
 # ─── ШАГИ ДИАЛОГА ───────────────────────────────────────────────────────────
-(PORTFOLIO, CITY, TT_NAME, LOCATION, PHOTO,
- BRANDS_SELECT, GOLDEN_SHELF, OMP, DMP, RATING, NOTES) = range(11)
+(PORTFOLIO, CITY, TT_NAME, LOCATION, TT_FORMAT, PHOTO,
+ BRANDS_SELECT, SKU_INPUT, NOTES) = range(9)
 
 
 # ─── GOOGLE HELPERS ─────────────────────────────────────────────────────────
@@ -62,7 +77,16 @@ def get_google_creds():
     return Credentials.from_service_account_info(creds_info, scopes=scopes)
 
 
+SHEET_HEADER = [
+    "ID визита", "Дата", "Аудитор", "Портфель", "Город",
+    "Название ТТ", "Широта", "Долгота", "Формат ТТ",
+    "Бренд", "SKU", "Заметки", "Ссылка на фото"
+]
+
+
 def save_to_sheet(data: dict):
+    """Записывает аудит в 'длинном' формате: по одной строке на каждый бренд.
+    Если брендов нет — одна строка с пометкой 'Нет наших брендов' и SKU=0."""
     creds = get_google_creds()
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SHEET_ID)
@@ -70,15 +94,11 @@ def save_to_sheet(data: dict):
     try:
         ws = sh.worksheet("Аудит")
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Аудит", rows=1000, cols=20)
-        ws.append_row([
-            "ID визита", "Дата", "Аудитор", "Портфель", "Город",
-            "Название ТТ", "Широта", "Долгота",
-            "Бренды в точке", "Золотая полка", "ОМП", "ДМП",
-            "Оценка", "Заметки", "Ссылка на фото"
-        ])
+        ws = sh.add_worksheet(title="Аудит", rows=2000, cols=20)
+        ws.append_row(SHEET_HEADER)
 
-    ws.append_row([
+    # Общие поля визита (повторяются в каждой строке)
+    common = [
         data.get("visit_id", ""),
         data.get("date", ""),
         data.get("auditor", ""),
@@ -87,14 +107,23 @@ def save_to_sheet(data: dict):
         data.get("tt_name", ""),
         data.get("lat", ""),
         data.get("lon", ""),
-        data.get("brands", ""),
-        data.get("golden_shelf", ""),
-        data.get("omp", ""),
-        data.get("dmp", ""),
-        data.get("rating", ""),
-        data.get("notes", ""),
-        data.get("photo_url", ""),
-    ])
+        data.get("tt_format", ""),
+    ]
+
+    brand_sku = data.get("brand_sku", [])  # список кортежей (бренд, sku)
+    notes = data.get("notes", "")
+    photo_url = data.get("photo_url", "")
+
+    rows = []
+    if not brand_sku:
+        # Нет наших брендов — одна строка с пометкой
+        rows.append(common + ["Нет наших брендов", "0", notes, photo_url])
+    else:
+        for brand, sku in brand_sku:
+            rows.append(common + [brand, sku, notes, photo_url])
+
+    # append_rows — пишет все строки одним запросом
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
 # ─── ЯНДЕКС.ДИСК ────────────────────────────────────────────────────────────
@@ -110,7 +139,6 @@ def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
     base = "https://cloud-api.yandex.net/v1/disk/resources"
 
     try:
-        # 1. Получаем ссылку для загрузки
         r = requests.get(
             f"{base}/upload",
             headers=headers,
@@ -120,11 +148,9 @@ def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
         r.raise_for_status()
         href = r.json()["href"]
 
-        # 2. Загружаем байты файла
         up = requests.put(href, data=file_bytes, timeout=60)
         up.raise_for_status()
 
-        # 3. Публикуем файл
         requests.put(
             f"{base}/publish",
             headers=headers,
@@ -132,7 +158,6 @@ def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
             timeout=30,
         )
 
-        # 4. Получаем публичную ссылку
         meta = requests.get(
             base,
             headers=headers,
@@ -156,7 +181,6 @@ def is_authorized(user_id: int) -> bool:
 # ─── HANDLERS ───────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    # ДИАГНОСТИКА: пишем в лог, чей ID пришёл и какой список загружен
     logger.info(f"START от user_id={user_id} (тип {type(user_id).__name__}); "
                 f"список разрешённых={list(AUTHORIZED_USERS.keys())}; "
                 f"пускаем={user_id in AUTHORIZED_USERS}")
@@ -228,6 +252,24 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["lat"] = loc.latitude
     context.user_data["lon"] = loc.longitude
 
+    # Показываем описания форматов и кнопки выбора
+    descriptions = "\n\n".join(TT_FORMATS.values())
+    keyboard = [["AA+", "AA", "A"], ["B", "C", "D"]]
+    await update.message.reply_text(
+        f"🏷 *Выбери формат (тир) торговой точки:*\n\n{descriptions}",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+    return TT_FORMAT
+
+
+async def tt_format_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text not in TT_FORMATS:
+        await update.message.reply_text("Выбери формат из кнопок: AA+, AA, A, B, C или D.")
+        return TT_FORMAT
+    context.user_data["tt_format"] = text
+
     await update.message.reply_text(
         "📸 Отправь фото торговой точки (можно несколько).\n"
         "Когда закончишь — напиши *готово*.",
@@ -252,12 +294,16 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
-    keyboard = [[b] for b in brand_list] + [["✅ Выбор завершён"]]
+    # Инициализируем хранилище пар (бренд, sku)
+    context.user_data["brand_sku"] = []
     context.user_data["selected_brands"] = []
 
+    keyboard = [[b] for b in brand_list] + [[NO_BRANDS_LABEL], ["✅ Выбор завершён"]]
     await update.message.reply_text(
-        f"🏷 Какие бренды портфеля *{portfolio}* присутствуют в точке?\n"
-        "Выбирай по одному, затем нажми *«Выбор завершён»*.",
+        f"🏷 Какие бренды портфеля *{portfolio}* присутствуют в точке?\n\n"
+        "Нажми на бренд → впиши количество SKU этого бренда → выбери следующий.\n"
+        f"Если наших брендов в точке нет — нажми *«{NO_BRANDS_LABEL}»*.\n"
+        "Когда закончишь — нажми *«Выбор завершён»*.",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown"
     )
@@ -269,96 +315,62 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
 
+    # Нет наших брендов — сразу к заметкам, brand_sku остаётся пустым
+    if text == NO_BRANDS_LABEL:
+        context.user_data["brand_sku"] = []
+        return await ask_notes(update, context)
+
     if text == "✅ Выбор завершён":
-        selected = context.user_data.get("selected_brands", [])
-        if not selected:
-            await update.message.reply_text("Выбери хотя бы один бренд.")
+        if not context.user_data["brand_sku"]:
+            await update.message.reply_text(
+                f"Выбери хотя бы один бренд и впиши SKU, "
+                f"либо нажми *«{NO_BRANDS_LABEL}»*.",
+                parse_mode="Markdown"
+            )
             return BRANDS_SELECT
-        context.user_data["brands"] = ", ".join(selected)
-        return await ask_golden_shelf(update, context)
+        return await ask_notes(update, context)
 
     if text in brand_list:
-        if text not in context.user_data["selected_brands"]:
-            context.user_data["selected_brands"].append(text)
-            await update.message.reply_text(f"✅ {text} добавлен. Выбери ещё или нажми *«Выбор завершён»*.",
-                                            parse_mode="Markdown")
-        else:
-            await update.message.reply_text(f"⚠️ {text} уже выбран.")
+        if text in context.user_data["selected_brands"]:
+            await update.message.reply_text(f"⚠️ {text} уже добавлен. Выбери другой бренд.")
+            return BRANDS_SELECT
+        # Запоминаем, какой бренд сейчас вводим, и просим число SKU
+        context.user_data["current_brand"] = text
+        await update.message.reply_text(
+            f"🔢 Сколько SKU бренда *{text}* в точке? Впиши число:",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="Markdown"
+        )
+        return SKU_INPUT
+
+    # Любой другой текст
+    await update.message.reply_text("Выбери бренд из кнопок или нажми «Выбор завершён».")
     return BRANDS_SELECT
 
 
-async def ask_golden_shelf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["Да", "Нет", "Частично"]]
+async def sku_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sku = update.message.text.strip()
+    brand = context.user_data.get("current_brand")
+
+    context.user_data["brand_sku"].append((brand, sku))
+    context.user_data["selected_brands"].append(brand)
+
+    portfolio = context.user_data["portfolio"]
+    brand_list = BRANDS[portfolio]
+    # Оставляем в клавиатуре только ещё не выбранные бренды
+    remaining = [b for b in brand_list if b not in context.user_data["selected_brands"]]
+    keyboard = [[b] for b in remaining] + [["✅ Выбор завершён"]]
+
     await update.message.reply_text(
-        "⭐ *Золотая полка* — лучшее место в торговом зале на уровне глаз покупателя "
-        "(обычно 2-я и 3-я полка снизу), где товар заметен сразу при входе.\n\n"
-        "Наш товар находится на золотой полке?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+        f"✅ {brand}: {sku} SKU записано.\n"
+        "Выбери следующий бренд или нажми *«Выбор завершён»*.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown"
     )
-    return GOLDEN_SHELF
+    return BRANDS_SELECT
 
 
-async def golden_shelf_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text not in ["Да", "Нет", "Частично"]:
-        await update.message.reply_text("Выбери: Да, Нет или Частично.")
-        return GOLDEN_SHELF
-    context.user_data["golden_shelf"] = text
-
-    keyboard = [["Да", "Нет", "Частично"]]
-    await update.message.reply_text(
-        "🛒 *ОМП* (обязательное место продаж) — стеллаж или полка, "
-        "где наш товар должен присутствовать согласно стандарту.\n\n"
-        "Наш товар представлен в ОМП?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    return OMP
-
-
-async def omp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text not in ["Да", "Нет", "Частично"]:
-        await update.message.reply_text("Выбери: Да, Нет или Частично.")
-        return OMP
-    context.user_data["omp"] = text
-
-    keyboard = [["Да", "Нет", "Частично"]]
-    await update.message.reply_text(
-        "📦 *ДМП* (дополнительное место продаж) — паллет, стойка, дисплей или "
-        "любое дополнительное размещение товара вне основной полки.\n\n"
-        "В точке организовано ДМП?",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    return DMP
-
-
-async def dmp_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text not in ["Да", "Нет", "Частично"]:
-        await update.message.reply_text("Выбери: Да, Нет или Частично.")
-        return DMP
-    context.user_data["dmp"] = text
-
-    rating_text = "\n".join(RATINGS.values())
-    keyboard = [["1", "2", "3", "4", "5"]]
-    await update.message.reply_text(
-        f"📊 *Общая оценка представленности нашего товара:*\n\n{rating_text}",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
-    return RATING
-
-
-async def rating_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text not in RATINGS:
-        await update.message.reply_text("Выбери оценку от 1 до 5.")
-        return RATING
-    context.user_data["rating"] = text
-
+async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📝 Добавь заметки по точке (любые наблюдения, проблемы, возможности).\n"
         "Если заметок нет — напиши *нет*.",
@@ -401,18 +413,21 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка сохранения. Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Итоговый отчёт
+    # Формируем сводку по брендам
+    brand_sku = context.user_data.get("brand_sku", [])
+    if brand_sku:
+        brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
+    else:
+        brands_summary = "   • Нет наших брендов"
+
     d = context.user_data
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
         f"🗂 Портфель: {d.get('portfolio')}\n"
         f"🏙 Город: {d.get('city')}\n"
         f"🏪 ТТ: {d.get('tt_name')}\n"
-        f"🏷 Бренды: {d.get('brands')}\n"
-        f"⭐ Золотая полка: {d.get('golden_shelf')}\n"
-        f"🛒 ОМП: {d.get('omp')}\n"
-        f"📦 ДМП: {d.get('dmp')}\n"
-        f"📊 Оценка: {d.get('rating')}/5\n"
+        f"🏷 Формат: {d.get('tt_format')}\n"
+        f"🛍 Бренды и SKU:\n{brands_summary}\n"
         f"📝 Заметки: {d.get('notes') or '—'}\n"
         f"📸 Фото: {len(photo_urls)} шт.\n\n"
         f"Для нового аудита — /start"
@@ -450,15 +465,13 @@ def main():
             CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city_handler)],
             TT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_name_handler)],
             LOCATION: [MessageHandler(filters.LOCATION, location_handler)],
+            TT_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, tt_format_handler)],
             PHOTO: [
                 MessageHandler(filters.PHOTO, photo_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, photo_handler),
             ],
             BRANDS_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, brands_handler)],
-            GOLDEN_SHELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, golden_shelf_handler)],
-            OMP: [MessageHandler(filters.TEXT & ~filters.COMMAND, omp_handler)],
-            DMP: [MessageHandler(filters.TEXT & ~filters.COMMAND, dmp_handler)],
-            RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, rating_handler)],
+            SKU_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sku_input_handler)],
             NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -471,4 +484,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
