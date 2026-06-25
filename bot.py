@@ -98,7 +98,9 @@ TYPE_REPEAT = "Повторный аудит"
 
 # ─── ШАГИ ДИАЛОГА ───────────────────────────────────────────────────────────
 (AUDIT_TYPE, PORTFOLIO, CITY, REPEAT_CITY, REPEAT_PICK, TT_NAME, LOCATION,
- TT_FORMAT, PHOTO, BRANDS_SELECT, SKU_INPUT, FOCUS, NOTES) = range(13)
+ TT_FORMAT, PHOTO, BRANDS_SELECT, SKU_INPUT, FOCUS, NOTES,
+ CONFIRM, EDIT_MENU, EDIT_BRANDS, EDIT_SKU_PICK, EDIT_SKU_VALUE,
+ EDIT_DEL_PICK, EDIT_NOTES) = range(20)
 
 
 # ─── GOOGLE HELPERS ─────────────────────────────────────────────────────────
@@ -584,14 +586,171 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = update.message.text
     context.user_data["notes"] = "" if notes.lower() == "нет" else notes
+    return await show_confirm(update, context)
 
-    # Фото — последний шаг: аудитор грузит их по дороге к следующей точке
+
+def build_summary_text(context) -> str:
+    """Текстовая сводка визита для экрана подтверждения и финального сообщения."""
+    d = context.user_data
+    brand_sku = d.get("brand_sku", [])
+    if brand_sku:
+        brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
+    else:
+        brands_summary = "   • Нет наших брендов"
+
+    focus_answers = d.get("focus_answers", {})
+    portfolio = d.get("portfolio")
+    focus_lines = [f"   • {col}: {focus_answers.get(col, '—')}"
+                   for col, _q, _t in FOCUS_QUESTIONS.get(portfolio, [])]
+    focus_summary = "\n".join(focus_lines) if focus_lines else "   • —"
+
+    audit_line = ("🔁 Тип: повторный аудит\n" if d.get("audit_type") == TYPE_REPEAT
+                  else "🆕 Тип: первичный аудит\n")
+    return (
+        f"{audit_line}"
+        f"🗂 Портфель: {d.get('portfolio')}\n"
+        f"🏙 Город: {d.get('city')}\n"
+        f"🏪 ТТ: {d.get('tt_name')}\n"
+        f"🏷 Формат: {d.get('tt_format')}\n"
+        f"🛍 Бренды и SKU:\n{brands_summary}\n"
+        f"📋 Фокусные:\n{focus_summary}\n"
+        f"📝 Заметки: {d.get('notes') or '—'}"
+    )
+
+
+# ─── ПОДТВЕРЖДЕНИЕ И ПРАВКА ──────────────────────────────────────────────────
+async def show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["✅ Всё верно, сохранить"], ["✏️ Исправить"]]
     await update.message.reply_text(
-        "📸 Теперь приложи фото торговой точки (можно несколько).\n"
-        "Когда закончишь — напиши *готово*.",
-        reply_markup=ReplyKeyboardMarkup([["готово"]], resize_keyboard=True),
+        f"🔎 *Проверь данные перед сохранением:*\n\n{build_summary_text(context)}",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
         parse_mode="Markdown")
-    return PHOTO
+    return CONFIRM
+
+
+async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "✅ Всё верно, сохранить":
+        # Дальше — фото, затем сохранение
+        await update.message.reply_text(
+            "📸 Теперь приложи фото торговой точки (можно несколько).\n"
+            "Когда закончишь — напиши *готово*.",
+            reply_markup=ReplyKeyboardMarkup([["готово"]], resize_keyboard=True),
+            parse_mode="Markdown")
+        return PHOTO
+    if text == "✏️ Исправить":
+        keyboard = [["Бренды / SKU"], ["Заметки"], ["⬅️ Назад к проверке"]]
+        await update.message.reply_text(
+            "Что исправить?",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_MENU
+    await update.message.reply_text("Выбери действие из кнопок.")
+    return CONFIRM
+
+
+async def edit_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Бренды / SKU":
+        return await show_edit_brands(update, context)
+    if text == "Заметки":
+        await update.message.reply_text(
+            "📝 Введи заметки заново (или напиши *нет*):",
+            reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+        return EDIT_NOTES
+    if text == "⬅️ Назад к проверке":
+        return await show_confirm(update, context)
+    await update.message.reply_text("Выбери из кнопок.")
+    return EDIT_MENU
+
+
+async def edit_notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    notes = update.message.text
+    context.user_data["notes"] = "" if notes.lower() == "нет" else notes
+    await update.message.reply_text("✅ Заметки обновлены.")
+    return await show_confirm(update, context)
+
+
+async def show_edit_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    brand_sku = context.user_data.get("brand_sku", [])
+    if not brand_sku:
+        # брендов нет (был "Нет наших брендов") — править нечего
+        await update.message.reply_text(
+            "В этом визите бренды не отмечены (выбрано «Нет наших брендов»).")
+        return await show_confirm(update, context)
+    current = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
+    keyboard = [["🔢 Изменить SKU"], ["🗑 Удалить бренд"], ["⬅️ Назад к проверке"]]
+    await update.message.reply_text(
+        f"Текущие бренды:\n{current}\n\nЧто сделать?",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return EDIT_BRANDS
+
+
+async def edit_brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    brand_sku = context.user_data.get("brand_sku", [])
+
+    if text == "🔢 Изменить SKU":
+        keyboard = [[b] for b, _s in brand_sku] + [["⬅️ Отмена"]]
+        await update.message.reply_text(
+            "Выбери бренд, у которого изменить SKU:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_SKU_PICK
+    if text == "🗑 Удалить бренд":
+        keyboard = [[b] for b, _s in brand_sku] + [["⬅️ Отмена"]]
+        await update.message.reply_text(
+            "Выбери бренд для удаления:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_DEL_PICK
+    if text == "⬅️ Назад к проверке":
+        return await show_confirm(update, context)
+    await update.message.reply_text("Выбери из кнопок.")
+    return EDIT_BRANDS
+
+
+async def edit_sku_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Отмена":
+        return await show_edit_brands(update, context)
+    brands = [b for b, _s in context.user_data.get("brand_sku", [])]
+    if text not in brands:
+        await update.message.reply_text("Выбери бренд из кнопок.")
+        return EDIT_SKU_PICK
+    context.user_data["edit_brand"] = text
+    await update.message.reply_text(
+        f"🔢 Новое количество SKU для *{text}*:",
+        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+    return EDIT_SKU_VALUE
+
+
+async def edit_sku_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_sku = update.message.text.strip()
+    brand = context.user_data.get("edit_brand")
+    # обновляем значение в списке пар
+    pairs = context.user_data.get("brand_sku", [])
+    context.user_data["brand_sku"] = [
+        (b, new_sku if b == brand else s) for b, s in pairs
+    ]
+    await update.message.reply_text(f"✅ {brand}: SKU изменён на {new_sku}.")
+    return await show_edit_brands(update, context)
+
+
+async def edit_del_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Отмена":
+        return await show_edit_brands(update, context)
+    pairs = context.user_data.get("brand_sku", [])
+    brands = [b for b, _s in pairs]
+    if text not in brands:
+        await update.message.reply_text("Выбери бренд из кнопок.")
+        return EDIT_DEL_PICK
+    # удаляем бренд из пар и из списка выбранных
+    context.user_data["brand_sku"] = [(b, s) for b, s in pairs if b != text]
+    if "selected_brands" in context.user_data:
+        context.user_data["selected_brands"] = [
+            b for b in context.user_data["selected_brands"] if b != text
+        ]
+    await update.message.reply_text(f"🗑 Бренд {text} удалён.")
+    return await show_edit_brands(update, context)
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -625,31 +784,9 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     brand_sku = context.user_data.get("brand_sku", [])
-    if brand_sku:
-        brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
-    else:
-        brands_summary = "   • Нет наших брендов"
-
-    focus_answers = context.user_data.get("focus_answers", {})
-    portfolio = context.user_data.get("portfolio")
-    focus_lines = []
-    for col, qtext, qtype in FOCUS_QUESTIONS.get(portfolio, []):
-        focus_lines.append(f"   • {col}: {focus_answers.get(col, '—')}")
-    focus_summary = "\n".join(focus_lines) if focus_lines else "   • —"
-
-    d = context.user_data
-    audit_line = ("🔁 Тип: повторный аудит\n" if d.get("audit_type") == TYPE_REPEAT
-                  else "🆕 Тип: первичный аудит\n")
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
-        f"{audit_line}"
-        f"🗂 Портфель: {d.get('portfolio')}\n"
-        f"🏙 Город: {d.get('city')}\n"
-        f"🏪 ТТ: {d.get('tt_name')}\n"
-        f"🏷 Формат: {d.get('tt_format')}\n"
-        f"🛍 Бренды и SKU:\n{brands_summary}\n"
-        f"📋 Фокусные:\n{focus_summary}\n"
-        f"📝 Заметки: {d.get('notes') or '—'}\n"
+        f"{build_summary_text(context)}\n"
         f"📸 Фото: {len(photo_urls)} шт.\n\n"
         f"Для нового аудита — /start"
     )
@@ -695,6 +832,13 @@ def main():
             SKU_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sku_input_handler)],
             FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, focus_handler)],
             NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes_handler)],
+            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_handler)],
+            EDIT_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_menu_handler)],
+            EDIT_BRANDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_brands_handler)],
+            EDIT_SKU_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sku_pick_handler)],
+            EDIT_SKU_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sku_value_handler)],
+            EDIT_DEL_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_del_pick_handler)],
+            EDIT_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_notes_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
