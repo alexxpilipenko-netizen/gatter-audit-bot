@@ -44,7 +44,7 @@ ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 BRANDS = {
     "Ferrero": ["Nutella", "Ferrero Rocher", "Raffaello", "Kinder", "Tic Tac"],
-    "Food Mix": ["Mondelez", "Yunus", "La Milk", "Bizon", "Kent Boringer", "MAY", "Orion"],
+    "Food Mix": ["Mondelez", "Yunus", "La Milk", "Bizon", "Kent Boringer", "MAY", "Orion", "Korona"],
     "Non-Food": ["Lody", "Aerostar", "Energizer", "Wellnax", "Splat"],
 }
 
@@ -78,10 +78,8 @@ FOCUS_QUESTIONS = {
         ("Плиточный шоколад", "Наличие плиточного шоколада в категории", "yesno"),
     ],
     "Non-Food": [
-        ("Splat Биокальций", "Наличие Splat Биокальций", "yesno"),
-        ("Splat Лечебные травы", "Наличие Splat Лечебные травы", "yesno"),
-        ("Splat Отбеливание+", "Наличие Splat Отбеливание плюс", "yesno"),
-        ("Освежитель 300мл", "Наличие освежителя воздуха 300 мл", "yesno"),
+        ("ТОП-3 Splat", "Наличие ТОП-3 Splat", "yesno"),
+        ("Блок освежителей", "Наличие блока освежителей 300мл + 250мл", "yesno"),
     ],
     "Food Mix": [
         ("SKU предкасса", "Введите количество SKU на предкассовом узле", "number"),
@@ -480,26 +478,10 @@ async def tt_format_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Выбери формат из кнопок: AA+, AA, A, B, C или D.")
         return TT_FORMAT
     context.user_data["tt_format"] = text
-    await update.message.reply_text(
-        "📸 Отправь фото торговой точки (можно несколько).\n"
-        "Когда закончишь — напиши *готово*.",
-        reply_markup=ReplyKeyboardMarkup([["готово"]], resize_keyboard=True),
-        parse_mode="Markdown")
-    return PHOTO
+    return await ask_brands(update, context)
 
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text and update.message.text.lower() == "готово":
-        return await photo_done(update, context)
-    if update.message.photo:
-        context.user_data["photos"].append(update.message.photo[-1].file_id)
-        count = len(context.user_data["photos"])
-        await update.message.reply_text(f"✅ Фото {count} принято. Отправь ещё или напиши *готово*.",
-                                        parse_mode="Markdown")
-    return PHOTO
-
-
-async def photo_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def ask_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
     brand_list = BRANDS[portfolio]
     context.user_data["brand_sku"] = []
@@ -602,6 +584,29 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = update.message.text
     context.user_data["notes"] = "" if notes.lower() == "нет" else notes
+
+    # Фото — последний шаг: аудитор грузит их по дороге к следующей точке
+    await update.message.reply_text(
+        "📸 Теперь приложи фото торговой точки (можно несколько).\n"
+        "Когда закончишь — напиши *готово*.",
+        reply_markup=ReplyKeyboardMarkup([["готово"]], resize_keyboard=True),
+        parse_mode="Markdown")
+    return PHOTO
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text and update.message.text.lower() == "готово":
+        return await finalize_and_save(update, context)
+    if update.message.photo:
+        context.user_data["photos"].append(update.message.photo[-1].file_id)
+        count = len(context.user_data["photos"])
+        await update.message.reply_text(
+            f"✅ Фото {count} принято. Отправь ещё или напиши *готово*.",
+            parse_mode="Markdown")
+    return PHOTO
+
+
+async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Сохраняю данные...")
 
     visit_id = f"{update.effective_user.id}_{int(datetime.now().timestamp())}"
@@ -625,7 +630,6 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         brands_summary = "   • Нет наших брендов"
 
-    # сводка по фокусным
     focus_answers = context.user_data.get("focus_answers", {})
     portfolio = context.user_data.get("portfolio")
     focus_lines = []
