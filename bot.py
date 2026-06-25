@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import io
+import asyncio
 import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -224,6 +225,59 @@ def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка загрузки на Яндекс.Диск: {e}")
         return ""
+
+
+async def _download_and_upload_one(context, file_id, filename):
+    """Скачивает одно фото из Telegram и грузит на Яндекс.
+    Блокирующая загрузка вынесена в отдельный поток, чтобы не морозить event loop
+    (важно при нескольких аудиторах одновременно). Возвращает ссылку или ''."""
+    try:
+        tg_file = await context.bot.get_file(file_id)
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+        # to_thread: синхронный requests не блокирует общий event loop бота
+        return await asyncio.to_thread(upload_photo_to_yandex, file_bytes, filename)
+    except Exception as e:
+        logger.error(f"Ошибка обработки фото {filename}: {e}")
+        return ""
+
+
+async def upload_all_photos(update, context, visit_id):
+    """Грузит все фото визита ПАРАЛЛЕЛЬНО, показывая живой счётчик прогресса.
+    Возвращает список успешных ссылок (порядок не гарантирован)."""
+    photos = context.user_data.get("photos", [])
+    total = len(photos)
+    if total == 0:
+        return []
+
+    progress_msg = await update.message.reply_text(f"⏳ Загружаю фото: 0 из {total}...")
+
+    # Запускаем все загрузки одновременно
+    tasks = [
+        asyncio.create_task(
+            _download_and_upload_one(context, fid, f"{visit_id}_{i}.jpg")
+        )
+        for i, fid in enumerate(photos, 1)
+    ]
+
+    urls = []
+    done = 0
+    # as_completed отдаёт задачи по мере завершения (в любом порядке)
+    for coro in asyncio.as_completed(tasks):
+        link = await coro
+        done += 1
+        if link:
+            urls.append(link)
+        # обновляем то же сообщение со счётчиком
+        try:
+            await progress_msg.edit_text(f"⏳ Загружаю фото: {done} из {total}...")
+        except Exception:
+            pass  # Telegram иногда ругается на "message not modified" — не критично
+
+    try:
+        await progress_msg.edit_text(f"✅ Фото загружено: {len(urls)} из {total}.")
+    except Exception:
+        pass
+    return urls
 
 
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
@@ -548,23 +602,14 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = update.message.text
     context.user_data["notes"] = "" if notes.lower() == "нет" else notes
-    await update.message.reply_text("⏳ Сохраняю данные и загружаю фото...")
+    await update.message.reply_text("⏳ Сохраняю данные...")
 
     visit_id = f"{update.effective_user.id}_{int(datetime.now().timestamp())}"
     context.user_data["visit_id"] = visit_id
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    photo_urls = []
-    for i, file_id in enumerate(context.user_data.get("photos", []), 1):
-        try:
-            tg_file = await context.bot.get_file(file_id)
-            file_bytes = bytes(await tg_file.download_as_bytearray())
-            filename = f"{visit_id}_{i}.jpg"
-            link = upload_photo_to_yandex(file_bytes, filename)
-            if link:
-                photo_urls.append(link)
-        except Exception as e:
-            logger.error(f"Ошибка обработки фото: {e}")
+    # Параллельная загрузка фото с живым счётчиком (не блокирует бота)
+    photo_urls = await upload_all_photos(update, context, visit_id)
     context.user_data["photo_url"] = ", ".join(photo_urls)
 
     try:
