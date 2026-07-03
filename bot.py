@@ -71,7 +71,9 @@ TT_FORMATS = {
 FOCUS_QUESTIONS = {
     "Ferrero": [
         ("Об. Tic Tac касса", "Наличие оборудования Tic Tac на кассе", "yesno"),
-        ("Об. Kinder касса", "Наличие оборудования Kinder на кассе", "yesno"),
+        ("Об. Kinder касса",
+         "Наличие киндер блок на кассе — на оборудовании магазина или на нашем оборудовании?",
+         "choice3"),
         ("Ценники", "Наличие ценников", "yesno"),
         ("POSm", "Наличие POSm (шелф-токеры, воблеры, ленты и т.д.)", "yesno"),
         ("Семифреди", "Наличие Семифреди в ТТ", "yesno"),
@@ -82,10 +84,14 @@ FOCUS_QUESTIONS = {
         ("Блок освежителей", "Наличие блока освежителей 300мл + 250мл", "yesno"),
     ],
     "Food Mix": [
-        ("Choco Pie 48шт", "Наличие Choco Pie 48шт", "yesno"),
+        ("ЧП 48 касса", "Наличие ЧП 48 (штучные) на кассе", "yesno"),
+        ("ЧП 48 отдел", "Наличие ЧП 48 (штучные) в отделе", "yesno"),
         ("SKU предкасса", "Введите количество SKU на предкассовом узле", "number"),
     ],
 }
+
+# Варианты ответа для вопроса типа "choice3" (киндер блок на кассе)
+CHOICE3_OPTIONS = ["На оборудовании магазина", "На нашем оборудовании", "Нет"]
 
 # Все фокусные столбцы в фиксированном порядке (для шапки и записи)
 FOCUS_COLUMNS = []
@@ -101,7 +107,8 @@ TYPE_REPEAT = "Повторный аудит"
 (AUDIT_TYPE, PORTFOLIO, CITY, REPEAT_CITY, REPEAT_PICK, TT_NAME, LOCATION,
  TT_FORMAT, PHOTO, BRANDS_SELECT, SKU_INPUT, FOCUS, NOTES,
  CONFIRM, EDIT_MENU, EDIT_BRANDS, EDIT_SKU_PICK, EDIT_SKU_VALUE,
- EDIT_DEL_PICK, EDIT_NOTES) = range(20)
+ EDIT_DEL_PICK, EDIT_NOTES, EDIT_ADD_PICK, EDIT_ADD_SKU,
+ CANCEL_CONFIRM) = range(23)
 
 
 # ─── GOOGLE HELPERS ─────────────────────────────────────────────────────────
@@ -203,82 +210,121 @@ def save_to_sheet(data: dict):
 
 
 # ─── ЯНДЕКС.ДИСК ────────────────────────────────────────────────────────────
-def upload_photo_to_yandex(file_bytes: bytes, filename: str) -> str:
+YANDEX_API = "https://cloud-api.yandex.net/v1/disk/resources"
+
+
+def _ya_headers():
+    return {"Authorization": f"OAuth {YANDEX_TOKEN}"}
+
+
+def create_visit_folder(visit_id: str) -> str:
+    """Создаёт папку визита на Яндекс.Диске. Возвращает путь папки или '' при ошибке."""
     if not YANDEX_TOKEN:
         logger.error("YANDEX_TOKEN не задан")
         return ""
-    headers = {"Authorization": f"OAuth {YANDEX_TOKEN}"}
-    disk_path = f"{YANDEX_FOLDER}/{filename}"
-    base = "https://cloud-api.yandex.net/v1/disk/resources"
+    folder_path = f"{YANDEX_FOLDER}/{visit_id}"
     try:
-        r = requests.get(f"{base}/upload", headers=headers,
+        r = requests.put(YANDEX_API, headers=_ya_headers(),
+                         params={"path": folder_path}, timeout=30)
+        # 201 = создана; 409 = уже существует (тоже ок)
+        if r.status_code not in (201, 409):
+            r.raise_for_status()
+        return folder_path
+    except Exception as e:
+        logger.error(f"Ошибка создания папки визита: {e}")
+        return ""
+
+
+def upload_photo_to_folder(file_bytes: bytes, folder_path: str, filename: str) -> bool:
+    """Загружает фото в папку визита БЕЗ индивидуальной публикации
+    (доступ даёт публикация всей папки). Возвращает успех/неуспех."""
+    disk_path = f"{folder_path}/{filename}"
+    try:
+        r = requests.get(f"{YANDEX_API}/upload", headers=_ya_headers(),
                          params={"path": disk_path, "overwrite": "true"}, timeout=30)
         r.raise_for_status()
         href = r.json()["href"]
         up = requests.put(href, data=file_bytes, timeout=60)
         up.raise_for_status()
-        requests.put(f"{base}/publish", headers=headers,
-                     params={"path": disk_path}, timeout=30)
-        meta = requests.get(base, headers=headers,
-                            params={"path": disk_path, "fields": "public_url"}, timeout=30)
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка загрузки фото {filename}: {e}")
+        return False
+
+
+def publish_folder(folder_path: str) -> str:
+    """Публикует папку визита и возвращает её публичную ссылку (или '')."""
+    try:
+        requests.put(f"{YANDEX_API}/publish", headers=_ya_headers(),
+                     params={"path": folder_path}, timeout=30)
+        meta = requests.get(YANDEX_API, headers=_ya_headers(),
+                            params={"path": folder_path, "fields": "public_url"},
+                            timeout=30)
         meta.raise_for_status()
         return meta.json().get("public_url", "")
     except Exception as e:
-        logger.error(f"Ошибка загрузки на Яндекс.Диск: {e}")
+        logger.error(f"Ошибка публикации папки: {e}")
         return ""
 
 
-async def _download_and_upload_one(context, file_id, filename):
-    """Скачивает одно фото из Telegram и грузит на Яндекс.
-    Блокирующая загрузка вынесена в отдельный поток, чтобы не морозить event loop
-    (важно при нескольких аудиторах одновременно). Возвращает ссылку или ''."""
+async def _download_and_upload_one(context, file_id, folder_path, filename):
+    """Скачивает одно фото из Telegram и грузит в папку визита.
+    Блокирующая часть — в отдельном потоке (event loop свободен)."""
     try:
         tg_file = await context.bot.get_file(file_id)
         file_bytes = bytes(await tg_file.download_as_bytearray())
-        # to_thread: синхронный requests не блокирует общий event loop бота
-        return await asyncio.to_thread(upload_photo_to_yandex, file_bytes, filename)
+        return await asyncio.to_thread(
+            upload_photo_to_folder, file_bytes, folder_path, filename)
     except Exception as e:
         logger.error(f"Ошибка обработки фото {filename}: {e}")
-        return ""
+        return False
 
 
 async def upload_all_photos(update, context, visit_id):
-    """Грузит все фото визита ПАРАЛЛЕЛЬНО, показывая живой счётчик прогресса.
-    Возвращает список успешных ссылок (порядок не гарантирован)."""
+    """Создаёт папку визита, грузит все фото ПАРАЛЛЕЛЬНО с живым счётчиком,
+    публикует папку. Возвращает ОДНУ публичную ссылку на папку (или '')."""
     photos = context.user_data.get("photos", [])
     total = len(photos)
     if total == 0:
-        return []
+        return ""
+
+    # 1. Папка визита (один короткий последовательный шаг)
+    folder_path = await asyncio.to_thread(create_visit_folder, visit_id)
+    if not folder_path:
+        await update.message.reply_text(
+            "⚠️ Не удалось создать папку для фото — фото не сохранятся, "
+            "данные аудита будут записаны без них.")
+        return ""
 
     progress_msg = await update.message.reply_text(f"⏳ Загружаю фото: 0 из {total}...")
 
-    # Запускаем все загрузки одновременно
+    # 2. Параллельная заливка в папку (без индивидуальной публикации — быстрее)
     tasks = [
         asyncio.create_task(
-            _download_and_upload_one(context, fid, f"{visit_id}_{i}.jpg")
-        )
+            _download_and_upload_one(context, fid, folder_path, f"{visit_id}_{i}.jpg"))
         for i, fid in enumerate(photos, 1)
     ]
 
-    urls = []
+    ok_count = 0
     done = 0
-    # as_completed отдаёт задачи по мере завершения (в любом порядке)
     for coro in asyncio.as_completed(tasks):
-        link = await coro
+        success = await coro
         done += 1
-        if link:
-            urls.append(link)
-        # обновляем то же сообщение со счётчиком
+        if success:
+            ok_count += 1
         try:
             await progress_msg.edit_text(f"⏳ Загружаю фото: {done} из {total}...")
         except Exception:
-            pass  # Telegram иногда ругается на "message not modified" — не критично
+            pass
+
+    # 3. Публикация папки — одна ссылка на все фото визита
+    folder_url = await asyncio.to_thread(publish_folder, folder_path)
 
     try:
-        await progress_msg.edit_text(f"✅ Фото загружено: {len(urls)} из {total}.")
+        await progress_msg.edit_text(f"✅ Фото загружено: {ok_count} из {total}.")
     except Exception:
         pass
-    return urls
+    return folder_url
 
 
 # ─── АВТОРИЗАЦИЯ ────────────────────────────────────────────────────────────
@@ -300,6 +346,12 @@ async def ask_focus_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     col, qtext, qtype = questions[idx]
     if qtype == "yesno":
         keyboard = [["Да", "Нет"]]
+        await update.message.reply_text(
+            f"❓ {qtext}",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        )
+    elif qtype == "choice3":
+        keyboard = [[opt] for opt in CHOICE3_OPTIONS]
         await update.message.reply_text(
             f"❓ {qtext}",
             reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -569,6 +621,10 @@ async def focus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if answer not in ("Да", "Нет"):
             await update.message.reply_text("Выбери: Да или Нет.")
             return FOCUS
+    elif qtype == "choice3":
+        if answer not in CHOICE3_OPTIONS:
+            await update.message.reply_text("Выбери один из вариантов на кнопках.")
+            return FOCUS
     # number — принимаем как есть (по договорённости не валидируем)
 
     context.user_data["focus_answers"][col] = answer
@@ -621,7 +677,7 @@ def build_summary_text(context) -> str:
 
 # ─── ПОДТВЕРЖДЕНИЕ И ПРАВКА ──────────────────────────────────────────────────
 async def show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["✅ Всё верно, сохранить"], ["✏️ Исправить"]]
+    keyboard = [["✅ Всё верно, сохранить"], ["✏️ Исправить"], ["❌ Аннулировать аудит"]]
     await update.message.reply_text(
         f"🔎 *Проверь данные перед сохранением:*\n\n{build_summary_text(context)}",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
@@ -645,8 +701,30 @@ async def confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Что исправить?",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
         return EDIT_MENU
+    if text == "❌ Аннулировать аудит":
+        keyboard = [["Да, аннулировать"], ["Нет, вернуться"]]
+        await update.message.reply_text(
+            "⚠️ Точно аннулировать аудит? Все введённые данные будут потеряны.",
+            reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True,
+                                             resize_keyboard=True))
+        return CANCEL_CONFIRM
     await update.message.reply_text("Выбери действие из кнопок.")
     return CONFIRM
+
+
+async def cancel_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "Да, аннулировать":
+        context.user_data.clear()
+        await update.message.reply_text(
+            "❌ Аудит аннулирован, данные не сохранены.\n"
+            "Для нового аудита — /start",
+            reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    if text == "Нет, вернуться":
+        return await show_confirm(update, context)
+    await update.message.reply_text("Выбери: Да, аннулировать / Нет, вернуться.")
+    return CANCEL_CONFIRM
 
 
 async def edit_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -673,13 +751,12 @@ async def edit_notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def show_edit_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     brand_sku = context.user_data.get("brand_sku", [])
-    if not brand_sku:
-        # брендов нет (был "Нет наших брендов") — править нечего
-        await update.message.reply_text(
-            "В этом визите бренды не отмечены (выбрано «Нет наших брендов»).")
-        return await show_confirm(update, context)
-    current = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
-    keyboard = [["🔢 Изменить SKU"], ["🗑 Удалить бренд"], ["⬅️ Назад к проверке"]]
+    if brand_sku:
+        current = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
+    else:
+        current = "   • (брендов нет — было выбрано «Нет наших брендов»)"
+    keyboard = [["➕ Добавить бренд"], ["🔢 Изменить SKU"], ["🗑 Удалить бренд"],
+                ["⬅️ Назад к проверке"]]
     await update.message.reply_text(
         f"Текущие бренды:\n{current}\n\nЧто сделать?",
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
@@ -690,13 +767,32 @@ async def edit_brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text
     brand_sku = context.user_data.get("brand_sku", [])
 
+    if text == "➕ Добавить бренд":
+        portfolio = context.user_data["portfolio"]
+        already = [b for b, _s in brand_sku]
+        available = [b for b in BRANDS[portfolio] if b not in already]
+        if not available:
+            await update.message.reply_text(
+                "Все бренды портфеля уже добавлены.")
+            return await show_edit_brands(update, context)
+        keyboard = [[b] for b in available] + [["⬅️ Отмена"]]
+        await update.message.reply_text(
+            "Выбери бренд для добавления:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+        return EDIT_ADD_PICK
     if text == "🔢 Изменить SKU":
+        if not brand_sku:
+            await update.message.reply_text("Список брендов пуст — сначала добавь бренд.")
+            return await show_edit_brands(update, context)
         keyboard = [[b] for b, _s in brand_sku] + [["⬅️ Отмена"]]
         await update.message.reply_text(
             "Выбери бренд, у которого изменить SKU:",
             reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
         return EDIT_SKU_PICK
     if text == "🗑 Удалить бренд":
+        if not brand_sku:
+            await update.message.reply_text("Список брендов пуст — удалять нечего.")
+            return await show_edit_brands(update, context)
         keyboard = [[b] for b, _s in brand_sku] + [["⬅️ Отмена"]]
         await update.message.reply_text(
             "Выбери бренд для удаления:",
@@ -706,6 +802,33 @@ async def edit_brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await show_confirm(update, context)
     await update.message.reply_text("Выбери из кнопок.")
     return EDIT_BRANDS
+
+
+async def edit_add_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == "⬅️ Отмена":
+        return await show_edit_brands(update, context)
+    portfolio = context.user_data["portfolio"]
+    already = [b for b, _s in context.user_data.get("brand_sku", [])]
+    available = [b for b in BRANDS[portfolio] if b not in already]
+    if text not in available:
+        await update.message.reply_text("Выбери бренд из кнопок.")
+        return EDIT_ADD_PICK
+    context.user_data["edit_brand"] = text
+    await update.message.reply_text(
+        f"🔢 Сколько SKU бренда *{text}* в точке? Впиши число:",
+        reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+    return EDIT_ADD_SKU
+
+
+async def edit_add_sku_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sku = update.message.text.strip()
+    brand = context.user_data.get("edit_brand")
+    context.user_data.setdefault("brand_sku", []).append((brand, sku))
+    if "selected_brands" in context.user_data:
+        context.user_data["selected_brands"].append(brand)
+    await update.message.reply_text(f"✅ {brand}: {sku} SKU добавлено.")
+    return await show_edit_brands(update, context)
 
 
 async def edit_sku_pick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -774,8 +897,8 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     # Параллельная загрузка фото с живым счётчиком (не блокирует бота)
-    photo_urls = await upload_all_photos(update, context, visit_id)
-    context.user_data["photo_url"] = ", ".join(photo_urls)
+    folder_url = await upload_all_photos(update, context, visit_id)
+    context.user_data["photo_url"] = folder_url
 
     try:
         save_to_sheet(context.user_data)
@@ -788,7 +911,7 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
         f"{build_summary_text(context)}\n"
-        f"📸 Фото: {len(photo_urls)} шт.\n\n"
+        f"📸 Фото: {len(context.user_data.get('photos', []))} шт.\n\n"
         f"Для нового аудита — /start"
     )
     await update.message.reply_text(summary, parse_mode="Markdown")
@@ -840,6 +963,9 @@ def main():
             EDIT_SKU_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_sku_value_handler)],
             EDIT_DEL_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_del_pick_handler)],
             EDIT_NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_notes_handler)],
+            EDIT_ADD_PICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_pick_handler)],
+            EDIT_ADD_SKU: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_add_sku_handler)],
+            CANCEL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, cancel_confirm_handler)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
