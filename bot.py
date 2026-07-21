@@ -50,7 +50,8 @@ BRANDS = {
 
 CITIES = [
     "Ташкент", "Самарканд", "Андижан", "Бухара", "Фергана",
-    "Ургенч", "Коканд", "Наманган", "Джиззак", "Карши", "Навои"
+    "Ургенч", "Коканд", "Наманган", "Джиззак", "Карши", "Навои",
+    "Гулистан", "Ангрен", "Чирчик", "Янгиюль"
 ]
 
 TT_FORMATS = {
@@ -634,7 +635,8 @@ async def focus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📝 Добавь заметки по точке (любые наблюдения, проблемы, возможности).\n"
+        "📝 Добавь заметки по точке: наблюдения, проблемы, возможности, "
+        "итоги общения с ЛПР точки.\n"
         "Если заметок нет — напиши *нет*.",
         reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
     return NOTES
