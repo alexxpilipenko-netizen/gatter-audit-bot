@@ -210,6 +210,123 @@ def save_to_sheet(data: dict):
     ws.append_rows(rows, value_input_option="USER_ENTERED")
 
 
+def compute_day_stats(auditor: str, date_prefix: str) -> str:
+    """Читает таблицу и собирает статистику по точкам аудитора за указанную дату
+    (date_prefix — 'ДД.ММ.ГГГГ'). Возвращает готовый текст итога дня."""
+    from collections import Counter, defaultdict
+    ws = _get_worksheet()
+    all_rows = ws.get_all_values()
+    if not all_rows or len(all_rows) < 2:
+        return "За сегодня нет сохранённых аудитов."
+    data = all_rows[1:]
+
+    # строки этого аудитора за эту дату
+    day = []
+    for r in data:
+        if len(r) < len(SHEET_HEADER):
+            r = r + [""] * (len(SHEET_HEADER) - len(r))
+        if r[COL["Аудитор"]] == auditor and r[COL["Дата"]].startswith(date_prefix):
+            day.append(r)
+    if not day:
+        return f"За {date_prefix} у вас нет сохранённых аудитов."
+
+    # группировка по визитам
+    visits = defaultdict(list)
+    for r in day:
+        visits[r[COL["ID визита"]]].append(r)
+
+    n_visits = len(visits)
+    portf_c, city_c, fmt_c = Counter(), Counter(), Counter()
+    visit_portf = {}
+    for vid, rs in visits.items():
+        p = rs[0][COL["Портфель"]]
+        visit_portf[vid] = p
+        portf_c[p] += 1
+        city_c[rs[0][COL["Город"]]] += 1
+        fmt_c[rs[0][COL["Формат ТТ"]]] += 1
+
+    # провалы по Да/Нет и choice3 фокусным (в разрезе портфеля)
+    fails = {}
+    for vid, rs in visits.items():
+        p = visit_portf[vid]
+        first = rs[0]
+        for col, qtext, qtype in FOCUS_QUESTIONS.get(p, []):
+            if qtype == "number":
+                continue
+            ans = first[COL[col]]
+            fails.setdefault((p, col), [0, 0])
+            fails[(p, col)][1] += 1
+            if ans == "Нет":
+                fails[(p, col)][0] += 1
+
+    # бренды: средний SKU и % отсутствия (в разрезе портфеля)
+    brand_sku_agg = {}
+    brand_absent = {}
+    for vid, rs in visits.items():
+        p = visit_portf[vid]
+        present = {r[COL["Бренд"]]: r[COL["SKU"]] for r in rs
+                   if r[COL["Бренд"]] not in ("", "Нет наших брендов")}
+        for b in BRANDS.get(p, []):
+            brand_absent.setdefault(b, [0, 0])
+            brand_absent[b][1] += 1
+            if b in present:
+                try:
+                    brand_sku_agg.setdefault(b, [0, 0])
+                    brand_sku_agg[b][0] += int(present[b])
+                    brand_sku_agg[b][1] += 1
+                except ValueError:
+                    pass
+            else:
+                brand_absent[b][0] += 1
+
+    # SKU предкассы — среднее (только Food Mix)
+    pk = []
+    for vid, rs in visits.items():
+        if visit_portf[vid] == "Food Mix":
+            v = rs[0][COL["SKU предкасса"]]
+            try:
+                pk.append(int(v))
+            except ValueError:
+                pass
+
+    # ── формируем текст ──
+    lines = [f"📊 *Итог дня — {date_prefix}*", ""]
+    lines.append(f"Пройдено точек: *{n_visits}*")
+    lines.append("По портфелям: " + ", ".join(f"{k} — {v}" for k, v in portf_c.items()))
+    lines.append("По городам: " + ", ".join(f"{k} — {v}" for k, v in city_c.items()))
+    lines.append("Форматы: " + ", ".join(f"{k} — {v}" for k, v in fmt_c.items()))
+
+    # провалы — показываем где есть хоть один "Нет", сортируем по доле убыв.
+    fail_items = [((p, col), fc) for (p, col), fc in fails.items() if fc[0] > 0]
+    fail_items.sort(key=lambda x: x[1][0] / x[1][1], reverse=True)
+    if fail_items:
+        lines.append("")
+        lines.append("⚠️ *Провалы (где «Нет»):*")
+        for (p, col), (f, t) in fail_items:
+            lines.append(f"• [{p}] {col}: {f} из {t} ({round(f*100/t)}%)")
+
+    # представленность брендов
+    if brand_sku_agg:
+        lines.append("")
+        lines.append("🛍 *Средний SKU по брендам:*")
+        for b, (s, c) in brand_sku_agg.items():
+            lines.append(f"• {b}: {round(s/c, 1)} (в {c} т.)")
+
+    absent_items = [(b, a, t) for b, (a, t) in brand_absent.items() if a > 0]
+    absent_items.sort(key=lambda x: x[1] / x[2], reverse=True)
+    if absent_items:
+        lines.append("")
+        lines.append("❌ *Отсутствие бренда (% точек портфеля):*")
+        for b, a, t in absent_items:
+            lines.append(f"• {b}: нет в {a} из {t} ({round(a*100/t)}%)")
+
+    if pk:
+        lines.append("")
+        lines.append(f"🧾 SKU на предкассе (среднее): *{round(sum(pk)/len(pk), 1)}*")
+
+    return "\n".join(lines)
+
+
 # ─── ЯНДЕКС.ДИСК ────────────────────────────────────────────────────────────
 YANDEX_API = "https://cloud-api.yandex.net/v1/disk/resources"
 
@@ -909,14 +1026,20 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка сохранения. Обратитесь к администратору.")
         return ConversationHandler.END
 
-    brand_sku = context.user_data.get("brand_sku", [])
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
         f"{build_summary_text(context)}\n"
-        f"📸 Фото: {len(context.user_data.get('photos', []))} шт.\n\n"
-        f"Для нового аудита — /start"
+        f"📸 Фото: {len(context.user_data.get('photos', []))} шт."
     )
     await update.message.reply_text(summary, parse_mode="Markdown")
+
+    # Вопрос про конец дня + постоянные кнопки
+    keyboard = [["🆕 Новый аудит"], ["📊 Итог дня"]]
+    await update.message.reply_text(
+        "Что дальше?\n"
+        "• «🆕 Новый аудит» — следующая точка\n"
+        "• «📊 Итог дня» — статистика по вашим точкам за сегодня",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
     return ConversationHandler.END
 
 
@@ -925,6 +1048,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Аудит отменён. Для начала нового — /start",
         reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+async def day_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка/команда «Итог дня» — статистика по точкам аудитора за сегодня."""
+    user = update.effective_user
+    if not is_authorized(user.id):
+        return
+    auditor = user.full_name or "Аудитор"
+    today = datetime.now().strftime("%d.%m.%Y")
+    await update.message.reply_text("⏳ Считаю итог дня...")
+    try:
+        text = compute_day_stats(auditor, today)
+    except Exception as e:
+        logger.error(f"Ошибка расчёта итога дня: {e}")
+        await update.message.reply_text("❌ Не удалось посчитать итог. Попробуйте позже.")
+        return
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -940,7 +1080,10 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex("^🆕 Новый аудит$"), start),
+        ],
         states={
             AUDIT_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, audit_type_handler)],
             REPEAT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, repeat_city_handler)],
@@ -973,6 +1116,8 @@ def main():
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("whoami", whoami))
+    app.add_handler(CommandHandler("itog", day_stats_handler))
+    app.add_handler(MessageHandler(filters.Regex("^📊 Итог дня$"), day_stats_handler))
     app.run_polling()
 
 
