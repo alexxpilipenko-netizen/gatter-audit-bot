@@ -101,6 +101,9 @@ for _portf in ["Ferrero", "Non-Food", "Food Mix"]:
         FOCUS_COLUMNS.append(_col)
 
 NO_BRANDS_LABEL = "❌ Нет наших брендов"
+GRAY_LABEL = "📦 Серый импорт"
+GRAY_BACK = "⬅️ Назад к нашим брендам"
+GRAY_SUFFIX = " (серый)"
 TYPE_PRIMARY = "Первичный аудит"
 TYPE_REPEAT = "Повторный аудит"
 
@@ -109,7 +112,7 @@ TYPE_REPEAT = "Повторный аудит"
  TT_FORMAT, PHOTO, BRANDS_SELECT, SKU_INPUT, FOCUS, NOTES,
  CONFIRM, EDIT_MENU, EDIT_BRANDS, EDIT_SKU_PICK, EDIT_SKU_VALUE,
  EDIT_DEL_PICK, EDIT_NOTES, EDIT_ADD_PICK, EDIT_ADD_SKU,
- CANCEL_CONFIRM) = range(23)
+ CANCEL_CONFIRM, GRAY_SELECT, GRAY_SKU) = range(25)
 
 
 # ─── GOOGLE HELPERS ─────────────────────────────────────────────────────────
@@ -260,12 +263,27 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
                 fails[(p, col)][0] += 1
 
     # бренды: средний SKU и % отсутствия (в разрезе портфеля)
+    # серый импорт (суффикс) считаем отдельно, в легальную представленность не включаем
     brand_sku_agg = {}
     brand_absent = {}
+    gray_agg = {}  # "Бренд" -> [sum_sku, visits_count]
     for vid, rs in visits.items():
         p = visit_portf[vid]
-        present = {r[COL["Бренд"]]: r[COL["SKU"]] for r in rs
-                   if r[COL["Бренд"]] not in ("", "Нет наших брендов")}
+        present = {}
+        for r in rs:
+            b = r[COL["Бренд"]]
+            if b in ("", "Нет наших брендов"):
+                continue
+            if b.endswith(GRAY_SUFFIX):
+                gb = b.replace(GRAY_SUFFIX, "")
+                gray_agg.setdefault(gb, [0, 0])
+                try:
+                    gray_agg[gb][0] += int(r[COL["SKU"]])
+                    gray_agg[gb][1] += 1
+                except ValueError:
+                    pass
+            else:
+                present[b] = r[COL["SKU"]]
         for b in BRANDS.get(p, []):
             brand_absent.setdefault(b, [0, 0])
             brand_absent[b][1] += 1
@@ -323,6 +341,12 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
     if pk:
         lines.append("")
         lines.append(f"🧾 SKU на предкассе (среднее): *{round(sum(pk)/len(pk), 1)}*")
+
+    if gray_agg:
+        lines.append("")
+        lines.append("📦 *Серый импорт (Ferrero):*")
+        for b, (s, c) in gray_agg.items():
+            lines.append(f"• {b}: {s} SKU в {c} т.")
 
     return "\n".join(lines)
 
@@ -654,18 +678,35 @@ async def tt_format_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await ask_brands(update, context)
 
 
+def brands_keyboard(context, remaining=None):
+    """Клавиатура выбора брендов. Кнопка «Серый импорт» — только для Ferrero."""
+    portfolio = context.user_data["portfolio"]
+    if remaining is None:
+        rows = [[b] for b in BRANDS[portfolio]]
+    else:
+        rows = [[b] for b in remaining]
+    tail = []
+    if portfolio == "Ferrero":
+        tail.append([GRAY_LABEL])
+    if remaining is None:
+        tail.append([NO_BRANDS_LABEL])
+    tail.append(["✅ Выбор завершён"])
+    return rows + tail
+
+
 async def ask_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     portfolio = context.user_data["portfolio"]
-    brand_list = BRANDS[portfolio]
     context.user_data["brand_sku"] = []
     context.user_data["selected_brands"] = []
-    keyboard = [[b] for b in brand_list] + [[NO_BRANDS_LABEL], ["✅ Выбор завершён"]]
+    gray_hint = ("Серый импорт отмечай кнопкой *«Серый импорт»*.\n"
+                 if portfolio == "Ferrero" else "")
     await update.message.reply_text(
         f"🏷 Какие бренды портфеля *{portfolio}* присутствуют в точке?\n\n"
         "Нажми на бренд → впиши количество SKU этого бренда → выбери следующий.\n"
+        f"{gray_hint}"
         f"Если наших брендов в точке нет — нажми *«{NO_BRANDS_LABEL}»*.\n"
         "Когда закончишь — нажми *«Выбор завершён»*.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        reply_markup=ReplyKeyboardMarkup(brands_keyboard(context), resize_keyboard=True),
         parse_mode="Markdown")
     return BRANDS_SELECT
 
@@ -677,10 +718,12 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == NO_BRANDS_LABEL:
         context.user_data["brand_sku"] = []
-        # фокусные задаём даже без брендов
         context.user_data["focus_idx"] = 0
         context.user_data["focus_answers"] = {}
         return await ask_focus_question(update, context)
+
+    if text == GRAY_LABEL:
+        return await ask_gray_brands(update, context)
 
     if text == "✅ Выбор завершён":
         if not context.user_data["brand_sku"]:
@@ -712,15 +755,66 @@ async def sku_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["brand_sku"].append((brand, sku))
     context.user_data["selected_brands"].append(brand)
     portfolio = context.user_data["portfolio"]
-    brand_list = BRANDS[portfolio]
-    remaining = [b for b in brand_list if b not in context.user_data["selected_brands"]]
-    keyboard = [[b] for b in remaining] + [["✅ Выбор завершён"]]
+    remaining = [b for b in BRANDS[portfolio] if b not in context.user_data["selected_brands"]]
     await update.message.reply_text(
         f"✅ {brand}: {sku} SKU записано.\n"
         "Выбери следующий бренд или нажми *«Выбор завершён»*.",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        reply_markup=ReplyKeyboardMarkup(brands_keyboard(context, remaining),
+                                         resize_keyboard=True),
         parse_mode="Markdown")
     return BRANDS_SELECT
+
+
+# ── СЕРЫЙ ИМПОРТ (только Ferrero) ──
+async def ask_gray_brands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список брендов Ferrero для отметки как серый импорт."""
+    gray_selected = [b.replace(GRAY_SUFFIX, "") for b, _s in context.user_data["brand_sku"]
+                     if b.endswith(GRAY_SUFFIX)]
+    remaining = [b for b in BRANDS["Ferrero"] if b not in gray_selected]
+    keyboard = [[b] for b in remaining] + [[GRAY_BACK]]
+    await update.message.reply_text(
+        "📦 *Серый импорт.* Отметь бренд серого импорта → впиши количество SKU.\n"
+        f"Когда закончишь — нажми *«{GRAY_BACK}»*.",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True),
+        parse_mode="Markdown")
+    return GRAY_SELECT
+
+
+async def gray_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    if text == GRAY_BACK:
+        # возврат к обычному выбору брендов
+        selected = context.user_data["selected_brands"]
+        remaining = [b for b in BRANDS["Ferrero"] if b not in selected]
+        await update.message.reply_text(
+            "Возврат к выбору наших брендов.",
+            reply_markup=ReplyKeyboardMarkup(brands_keyboard(context, remaining),
+                                             resize_keyboard=True))
+        return BRANDS_SELECT
+
+    if text in BRANDS["Ferrero"]:
+        gray_selected = [b.replace(GRAY_SUFFIX, "") for b, _s in context.user_data["brand_sku"]
+                         if b.endswith(GRAY_SUFFIX)]
+        if text in gray_selected:
+            await update.message.reply_text(f"⚠️ {text} (серый) уже отмечен. Выбери другой.")
+            return GRAY_SELECT
+        context.user_data["current_gray_brand"] = text
+        await update.message.reply_text(
+            f"🔢 Сколько SKU серого импорта *{text}*? Впиши число:",
+            reply_markup=ReplyKeyboardRemove(), parse_mode="Markdown")
+        return GRAY_SKU
+
+    await update.message.reply_text("Выбери бренд из кнопок или нажми «Назад».")
+    return GRAY_SELECT
+
+
+async def gray_sku_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sku = update.message.text.strip()
+    brand = context.user_data.get("current_gray_brand")
+    # храним с суффиксом (серый), чтобы не смешивать с легальной представленностью
+    context.user_data["brand_sku"].append((brand + GRAY_SUFFIX, sku))
+    await update.message.reply_text(f"✅ {brand} (серый): {sku} SKU записано.")
+    return await ask_gray_brands(update, context)
 
 
 async def focus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -769,10 +863,20 @@ def build_summary_text(context) -> str:
     """Текстовая сводка визита для экрана подтверждения и финального сообщения."""
     d = context.user_data
     brand_sku = d.get("brand_sku", [])
-    if brand_sku:
-        brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in brand_sku)
-    else:
+    legal = [(b, s) for b, s in brand_sku if not b.endswith(GRAY_SUFFIX)]
+    gray = [(b.replace(GRAY_SUFFIX, ""), s) for b, s in brand_sku if b.endswith(GRAY_SUFFIX)]
+
+    if legal:
+        brands_summary = "\n".join(f"   • {b}: {s} SKU" for b, s in legal)
+    elif not brand_sku:
         brands_summary = "   • Нет наших брендов"
+    else:
+        brands_summary = "   • —"
+
+    gray_block = ""
+    if gray:
+        gray_lines = "\n".join(f"   • {b}: {s} SKU" for b, s in gray)
+        gray_block = f"📦 Серый импорт:\n{gray_lines}\n"
 
     focus_answers = d.get("focus_answers", {})
     portfolio = d.get("portfolio")
@@ -789,6 +893,7 @@ def build_summary_text(context) -> str:
         f"🏪 ТТ: {d.get('tt_name')}\n"
         f"🏷 Формат: {d.get('tt_format')}\n"
         f"🛍 Бренды и SKU:\n{brands_summary}\n"
+        f"{gray_block}"
         f"📋 Фокусные:\n{focus_summary}\n"
         f"📝 Заметки: {d.get('notes') or '—'}"
     )
@@ -1099,6 +1204,8 @@ def main():
             ],
             BRANDS_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, brands_handler)],
             SKU_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sku_input_handler)],
+            GRAY_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, gray_select_handler)],
+            GRAY_SKU: [MessageHandler(filters.TEXT & ~filters.COMMAND, gray_sku_handler)],
             FOCUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, focus_handler)],
             NOTES: [MessageHandler(filters.TEXT & ~filters.COMMAND, notes_handler)],
             CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_handler)],
