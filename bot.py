@@ -3,6 +3,8 @@ import os
 import json
 import io
 import asyncio
+import time
+import re
 import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -116,6 +118,53 @@ TYPE_REPEAT = "Повторный аудит"
 
 
 # ─── GOOGLE HELPERS ─────────────────────────────────────────────────────────
+# ─── RETRY ДЛЯ ВРЕМЕННЫХ ОШИБОК GOOGLE ───────────────────────────────────────
+# Google Sheets иногда отвечает временной ошибкой (503 сервис недоступен,
+# 500 внутренняя, 429 слишком много запросов). Такие ошибки проходят при
+# повторе — поэтому повторяем несколько раз с нарастающей паузой, чтобы не
+# терять визит из-за секундного сбоя. Постоянные ошибки (например 400/403)
+# не повторяем — от повтора они не исчезнут.
+TEMPORARY_GOOGLE_CODES = {429, 500, 502, 503, 504}
+
+
+def _extract_http_code(exc):
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code:
+            return code
+        try:
+            j = resp.json()
+            return j.get("error", {}).get("code") or j.get("code")
+        except Exception:
+            pass
+    m = re.search(r"'code': (\d+)", str(exc)) or re.search(r"\b(429|500|502|503|504)\b", str(exc))
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def with_google_retry(fn, attempts=4, base_delay=2):
+    """Выполняет fn с повтором при временных ошибках Google.
+    Пауза нарастает: 2, 4, 6 секунд. Постоянные ошибки пробрасываются сразу."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            code = _extract_http_code(e)
+            last = e
+            if code in TEMPORARY_GOOGLE_CODES and i < attempts - 1:
+                delay = base_delay * (i + 1)
+                logger.warning(f"Временная ошибка Google {code}, повтор через {delay}s "
+                               f"(попытка {i+1}/{attempts})")
+                time.sleep(delay)
+                continue
+            raise
+    if last:
+        raise last
+
+
 def get_google_creds():
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -148,7 +197,7 @@ def get_primary_without_repeat(city: str):
     """Первичные аудиты по городу, у которых ещё нет повторного.
     Возвращает список (visit_id, tt_name, date, auditor)."""
     ws = _get_worksheet()
-    all_rows = ws.get_all_values()
+    all_rows = with_google_retry(lambda: ws.get_all_values())
     if not all_rows or len(all_rows) < 2:
         return []
     data = all_rows[1:]
@@ -210,7 +259,7 @@ def save_to_sheet(data: dict):
         for brand, sku in brand_sku:
             rows.append(common + [brand, sku, notes, photo_url] + tail + focus_cells)
 
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    with_google_retry(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
 
 
 def compute_day_stats(auditor: str, date_prefix: str) -> str:
@@ -218,7 +267,7 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
     (date_prefix — 'ДД.ММ.ГГГГ'). Возвращает готовый текст итога дня."""
     from collections import Counter, defaultdict
     ws = _get_worksheet()
-    all_rows = ws.get_all_values()
+    all_rows = with_google_retry(lambda: ws.get_all_values())
     if not all_rows or len(all_rows) < 2:
         return "За сегодня нет сохранённых аудитов."
     data = all_rows[1:]
@@ -1116,20 +1165,29 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Сохраняю данные...")
 
-    visit_id = f"{update.effective_user.id}_{int(datetime.now().timestamp())}"
-    context.user_data["visit_id"] = visit_id
-    context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+    # Если это повторная попытка после сбоя Google — visit_id и фото уже есть,
+    # не грузим фото заново (иначе создастся дубль папки на Яндексе).
+    if not context.user_data.get("visit_id"):
+        context.user_data["visit_id"] = (
+            f"{update.effective_user.id}_{int(datetime.now().timestamp())}")
+        context.user_data["date"] = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-    # Параллельная загрузка фото с живым счётчиком (не блокирует бота)
-    folder_url = await upload_all_photos(update, context, visit_id)
-    context.user_data["photo_url"] = folder_url
+    if "photo_url" not in context.user_data:
+        folder_url = await upload_all_photos(update, context, context.user_data["visit_id"])
+        context.user_data["photo_url"] = folder_url
 
     try:
         save_to_sheet(context.user_data)
     except Exception as e:
         logger.error(f"Ошибка записи в Sheets: {e}")
-        await update.message.reply_text("❌ Ошибка сохранения. Обратитесь к администратору.")
-        return ConversationHandler.END
+        await update.message.reply_text(
+            "⚠️ Не удалось сохранить — сервис Google временно недоступен.\n"
+            "Данные визита не потеряны. Напиши *готово* ещё раз через минуту, "
+            "чтобы повторить сохранение.\n"
+            "Если не выходит несколько раз подряд — сообщи администратору.",
+            reply_markup=ReplyKeyboardMarkup([["готово"]], resize_keyboard=True),
+            parse_mode="Markdown")
+        return PHOTO
 
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
