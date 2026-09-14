@@ -46,7 +46,8 @@ ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 BRANDS = {
     "Ferrero": ["Nutella", "Ferrero Rocher", "Raffaello", "Kinder", "Tic Tac"],
-    "Food Mix": ["Mondelez", "Yunus", "La Milk", "Bizon", "Kent Boringer", "MAY", "Orion", "Korona"],
+    "Mondelez": ["Mondelez", "La Milk", "Bizon", "Kent Boringer", "Korona", "Toffee"],
+    "Food 2": ["MAY", "Orion", "Well", "Hoppy", "Победа"],
     "Non-Food": ["Lody", "Aerostar", "Energizer", "Wellnax", "Splat"],
 }
 
@@ -86,7 +87,10 @@ FOCUS_QUESTIONS = {
         ("ТОП-3 Splat", "Наличие ТОП-3 Splat", "yesno"),
         ("Блок освежителей", "Наличие блока освежителей 300мл + 250мл", "yesno"),
     ],
-    "Food Mix": [
+    "Mondelez": [
+        ("SKU предкасса", "Введите количество SKU на предкассовом узле", "number"),
+    ],
+    "Food 2": [
         ("ЧП 48 касса", "Наличие ЧП 48 (штучные) на кассе", "yesno"),
         ("ЧП 48 отдел", "Наличие ЧП 48 (штучные) в отделе", "yesno"),
         ("SKU предкасса", "Введите количество SKU на предкассовом узле", "number"),
@@ -98,9 +102,10 @@ CHOICE3_OPTIONS = ["На оборудовании магазина", "На на�
 
 # Все фокусные столбцы в фиксированном порядке (для шапки и записи)
 FOCUS_COLUMNS = []
-for _portf in ["Ferrero", "Non-Food", "Food Mix"]:
+for _portf in ["Ferrero", "Non-Food", "Food 2", "Mondelez"]:
     for _col, _q, _t in FOCUS_QUESTIONS[_portf]:
-        FOCUS_COLUMNS.append(_col)
+        if _col not in FOCUS_COLUMNS:   # один столбец, даже если вопрос в двух портфелях
+            FOCUS_COLUMNS.append(_col)
 
 NO_BRANDS_LABEL = "❌ Нет наших брендов"
 GRAY_LABEL = "📦 Серый импорт"
@@ -336,20 +341,25 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
         for b in BRANDS.get(p, []):
             brand_absent.setdefault(b, [0, 0])
             brand_absent[b][1] += 1
+            sku_val = present.get(b)
+            is_present = False
             if b in present:
                 try:
-                    brand_sku_agg.setdefault(b, [0, 0])
-                    brand_sku_agg[b][0] += int(present[b])
-                    brand_sku_agg[b][1] += 1
+                    is_present = int(sku_val) > 0  # 0 SKU = бренда фактически нет
                 except ValueError:
-                    pass
+                    is_present = False
+            if is_present:
+                brand_sku_agg.setdefault(b, [0, 0])
+                brand_sku_agg[b][0] += int(sku_val)
+                brand_sku_agg[b][1] += 1
             else:
                 brand_absent[b][0] += 1
 
-    # SKU предкассы — среднее (только Food Mix)
+    # SKU предкассы — среднее (по всем портфелям, где этот вопрос задаётся)
     pk = []
     for vid, rs in visits.items():
-        if visit_portf[vid] == "Food Mix":
+        p = visit_portf[vid]
+        if any(c == "SKU предкасса" for c, _q, _t in FOCUS_QUESTIONS.get(p, [])):
             v = rs[0][COL["SKU предкасса"]]
             try:
                 pk.append(int(v))
@@ -798,8 +808,25 @@ async def brands_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BRANDS_SELECT
 
 
+def valid_positive_sku(text: str):
+    """Проверяет, что введён SKU > 0. Возвращает (ок, значение_строкой) или (False, None)."""
+    t = text.strip()
+    try:
+        n = int(t)
+    except ValueError:
+        return False, None
+    if n <= 0:
+        return False, None
+    return True, str(n)
+
+
 async def sku_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sku = update.message.text.strip()
+    ok, sku = valid_positive_sku(update.message.text)
+    if not ok:
+        await update.message.reply_text(
+            "Введи число больше 0. Если бренда нет в точке — не выбирай его "
+            "(просто нажми другой бренд или «Выбор завершён»).")
+        return SKU_INPUT
     brand = context.user_data.get("current_brand")
     context.user_data["brand_sku"].append((brand, sku))
     context.user_data["selected_brands"].append(brand)
@@ -858,7 +885,12 @@ async def gray_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def gray_sku_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sku = update.message.text.strip()
+    ok, sku = valid_positive_sku(update.message.text)
+    if not ok:
+        await update.message.reply_text(
+            "Введи число больше 0. Если этого серого бренда нет — не выбирай его "
+            "(нажми другой бренд или «Назад»).")
+        return GRAY_SKU
     brand = context.user_data.get("current_gray_brand")
     # храним с суффиксом (серый), чтобы не смешивать с легальной представленностью
     context.user_data["brand_sku"].append((brand + GRAY_SUFFIX, sku))
@@ -1095,7 +1127,10 @@ async def edit_add_pick_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def edit_add_sku_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sku = update.message.text.strip()
+    ok, sku = valid_positive_sku(update.message.text)
+    if not ok:
+        await update.message.reply_text("Введи число больше 0.")
+        return EDIT_ADD_SKU
     brand = context.user_data.get("edit_brand")
     context.user_data.setdefault("brand_sku", []).append((brand, sku))
     if "selected_brands" in context.user_data:
@@ -1120,7 +1155,11 @@ async def edit_sku_pick_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def edit_sku_value_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    new_sku = update.message.text.strip()
+    ok, new_sku = valid_positive_sku(update.message.text)
+    if not ok:
+        await update.message.reply_text(
+            "Введи число больше 0. Если бренда нет — удали его через «Удалить бренд».")
+        return EDIT_SKU_VALUE
     brand = context.user_data.get("edit_brand")
     # обновляем значение в списке пар
     pairs = context.user_data.get("brand_sku", [])
