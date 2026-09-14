@@ -46,10 +46,55 @@ ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 BRANDS = {
     "Ferrero": ["Nutella", "Ferrero Rocher", "Raffaello", "Kinder", "Tic Tac"],
-    "Mondelez": ["Mondelez", "La Milk", "Bizon", "Kent Boringer", "Korona", "Toffee"],
+    "Mondelez": ["Mondelez", "La Milk", "Bizon", "Kent Boringer", "Korona", "Toffee", "Love is"],
     "Food 2": ["MAY", "Orion", "Well", "Hoppy", "Победа"],
     "Non-Food": ["Lody", "Aerostar", "Energizer", "Wellnax", "Splat"],
 }
+
+# ─── НОРМАТИВЫ MSL (MML) ────────────────────────────────────────────────────
+# Значение = количество SKU бренда, обязательных для данного формата ТТ.
+# Бренда нет в словаре или норма = 0 → бренд НЕ участвует в расчёте MSL
+# (ни в числителе, ни в знаменателе), но идёт в средний SKU.
+# Bizon и Победа норматива не имеют — данных по ним нет.
+MSL_NORMS = {
+    "Ferrero": {
+        "Nutella":        {"AA+": 3,  "AA": 3,  "A": 1,  "B": 2,  "C": 0,  "D": 0},
+        "Ferrero Rocher": {"AA+": 5,  "AA": 5,  "A": 2,  "B": 1,  "C": 0,  "D": 0},
+        "Raffaello":      {"AA+": 9,  "AA": 7,  "A": 5,  "B": 5,  "C": 3,  "D": 1},
+        "Kinder":         {"AA+": 14, "AA": 14, "A": 14, "B": 14, "C": 11, "D": 7},
+        "Tic Tac":        {"AA+": 9,  "AA": 7,  "A": 7,  "B": 7,  "C": 7,  "D": 6},
+    },
+    "Mondelez": {
+        "Mondelez":       {"AA+": 11, "AA": 8,  "A": 5,  "B": 1,  "C": 1,  "D": 0},
+        "La Milk":        {"AA+": 1,  "AA": 1,  "A": 1,  "B": 0,  "C": 0,  "D": 0},
+        "Kent Boringer":  {"AA+": 25, "AA": 23, "A": 17, "B": 16, "C": 10, "D": 7},
+        "Korona":         {"AA+": 5,  "AA": 5,  "A": 4,  "B": 3,  "C": 3,  "D": 2},
+        "Toffee":         {"AA+": 3,  "AA": 1,  "A": 1,  "B": 1,  "C": 1,  "D": 1},
+        "Love is":        {"AA+": 5,  "AA": 5,  "A": 5,  "B": 5,  "C": 2,  "D": 1},
+    },
+    "Food 2": {
+        "MAY":            {"AA+": 48, "AA": 29, "A": 15, "B": 9,  "C": 6,  "D": 4},
+        "Orion":          {"AA+": 22, "AA": 18, "A": 12, "B": 10, "C": 7,  "D": 5},
+        "Well":           {"AA+": 1,  "AA": 1,  "A": 1,  "B": 1,  "C": 1,  "D": 1},
+        "Hoppy":          {"AA+": 1,  "AA": 1,  "A": 1,  "B": 1,  "C": 1,  "D": 1},
+    },
+    "Non-Food": {
+        "Lody":           {"AA+": 8,  "AA": 8,  "A": 6,  "B": 3,  "C": 0,  "D": 0},
+        "Aerostar":       {"AA+": 20, "AA": 14, "A": 10, "B": 6,  "C": 3,  "D": 2},
+        "Energizer":      {"AA+": 4,  "AA": 4,  "A": 2,  "B": 2,  "C": 0,  "D": 0},
+        "Wellnax":        {"AA+": 12, "AA": 8,  "A": 6,  "B": 4,  "C": 0,  "D": 0},
+        "Splat":          {"AA+": 59, "AA": 44, "A": 14, "B": 12, "C": 12, "D": 10},
+    },
+}
+
+
+def msl_norm(portfolio: str, brand: str, tt_format: str):
+    """Норматив MSL или None, если бренд не нормируется в этом формате."""
+    n = MSL_NORMS.get(portfolio, {}).get(brand, {}).get(tt_format)
+    if not n:          # None или 0 — бренд вне расчёта MSL
+        return None
+    return n
+
 
 CITIES = [
     "Ташкент", "Самарканд", "Андижан", "Бухара", "Фергана",
@@ -179,7 +224,7 @@ def get_google_creds():
 BASE_HEADER = [
     "ID визита", "Дата", "Аудитор", "Портфель", "Город",
     "Название ТТ", "Широта", "Долгота", "Формат ТТ",
-    "Бренд", "SKU", "Заметки", "Ссылка на фото",
+    "Бренд", "SKU", "Норма MSL", "Заметки", "Ссылка на фото",
     "Тип аудита", "Связан с визитом"
 ]
 SHEET_HEADER = BASE_HEADER + FOCUS_COLUMNS
@@ -259,10 +304,19 @@ def save_to_sheet(data: dict):
 
     rows = []
     if not brand_sku:
-        rows.append(common + ["Нет наших брендов", "0", notes, photo_url] + tail + focus_cells)
+        rows.append(common + ["Нет наших брендов", "0", "", notes, photo_url]
+                    + tail + focus_cells)
     else:
+        portfolio = data.get("portfolio", "")
+        tt_format = data.get("tt_format", "")
         for brand, sku in brand_sku:
-            rows.append(common + [brand, sku, notes, photo_url] + tail + focus_cells)
+            if brand.endswith(GRAY_SUFFIX):
+                norm_cell = ""          # серый импорт вне расчёта MSL
+            else:
+                n = msl_norm(portfolio, brand, tt_format)
+                norm_cell = "" if n is None else n
+            rows.append(common + [brand, sku, norm_cell, notes, photo_url]
+                        + tail + focus_cells)
 
     with_google_retry(lambda: ws.append_rows(rows, value_input_option="USER_ENTERED"))
 
@@ -321,8 +375,12 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
     brand_sku_agg = {}
     brand_absent = {}
     gray_agg = {}  # "Бренд" -> [sum_sku, visits_count]
+    msl_num = msl_den = 0
+    msl_by_portf = {}   # портфель -> [num, den]
+    msl_by_brand = {}   # бренд -> [num, den]
     for vid, rs in visits.items():
         p = visit_portf[vid]
+        tt_format = rs[0][COL["Формат ТТ"]]
         present = {}
         for r in rs:
             b = r[COL["Бренд"]]
@@ -338,6 +396,25 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
                     pass
             else:
                 present[b] = r[COL["SKU"]]
+
+        # MSL: идём по ВСЕМ брендам портфеля — отсутствующие тоже в знаменателе
+        for b in BRANDS.get(p, []):
+            norm = msl_norm(p, b, tt_format)
+            if norm is None:
+                continue
+            try:
+                fact = int(present.get(b, 0))
+            except ValueError:
+                fact = 0
+            msl_num += min(fact, norm)
+            msl_den += norm
+            msl_by_portf.setdefault(p, [0, 0])
+            msl_by_portf[p][0] += min(fact, norm)
+            msl_by_portf[p][1] += norm
+            msl_by_brand.setdefault(b, [0, 0])
+            msl_by_brand[b][0] += min(fact, norm)
+            msl_by_brand[b][1] += norm
+
         for b in BRANDS.get(p, []):
             brand_absent.setdefault(b, [0, 0])
             brand_absent[b][1] += 1
@@ -381,6 +458,23 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
         lines.append("⚠️ *Провалы (где «Нет»):*")
         for (p, col), (f, t) in fail_items:
             lines.append(f"• [{p}] {col}: {f} из {t} ({round(f*100/t)}%)")
+
+    # выполнение MSL
+    if msl_den > 0:
+        lines.append("")
+        lines.append(f"🎯 *Выполнение MSL: {round(msl_num*100/msl_den)}%* "
+                     f"({msl_num}/{msl_den})")
+        if len(msl_by_portf) > 1:
+            for p, (n, d) in msl_by_portf.items():
+                if d > 0:
+                    lines.append(f"   • {p}: {round(n*100/d)}% ({n}/{d})")
+        worst = [(b, n, d) for b, (n, d) in msl_by_brand.items()
+                 if d > 0 and n < d]          # только невыполненные
+        worst.sort(key=lambda x: x[1] / x[2])
+        if worst:
+            lines.append("Худшие по MSL:")
+            for b, n, d in worst[:5]:
+                lines.append(f"   • {b}: {round(n*100/d)}% ({n}/{d})")
 
     # представленность брендов
     if brand_sku_agg:
@@ -940,6 +1034,43 @@ async def notes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await show_confirm(update, context)
 
 
+def build_visit_msl_text(context) -> str:
+    """MSL этого визита — показывается ТОЛЬКО после сохранения, чтобы аудитор
+    не подгонял цифры под норматив во время сбора данных."""
+    d = context.user_data
+    portfolio = d.get("portfolio", "")
+    tt_format = d.get("tt_format", "")
+    facts = {}
+    for b, s in d.get("brand_sku", []):
+        if b.endswith(GRAY_SUFFIX):
+            continue            # серый импорт в MSL не участвует
+        try:
+            facts[b] = int(s)
+        except (ValueError, TypeError):
+            facts[b] = 0
+
+    num = den = 0
+    misses = []
+    for b in BRANDS.get(portfolio, []):
+        norm = msl_norm(portfolio, b, tt_format)
+        if norm is None:
+            continue
+        fact = facts.get(b, 0)
+        num += min(fact, norm)
+        den += norm
+        if fact < norm:
+            misses.append((b, fact, norm))
+    if den == 0:
+        return ""
+    misses.sort(key=lambda x: (x[1] / x[2]) if x[2] else 0)
+    lines = [f"🎯 *Выполнение MSL: {round(num*100/den)}%* ({num}/{den})"]
+    if misses:
+        lines.append("Недобор:")
+        for b, f, n in misses[:5]:
+            lines.append(f"   • {b}: {f} из {n}")
+    return "\n".join(lines)
+
+
 def build_summary_text(context) -> str:
     """Текстовая сводка визита для экрана подтверждения и финального сообщения."""
     d = context.user_data
@@ -1228,10 +1359,12 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return PHOTO
 
+    msl_text = build_visit_msl_text(context)
     summary = (
         f"✅ *Аудит сохранён!*\n\n"
         f"{build_summary_text(context)}\n"
         f"📸 Фото: {len(context.user_data.get('photos', []))} шт."
+        + (f"\n\n{msl_text}" if msl_text else "")
     )
     await update.message.reply_text(summary, parse_mode="Markdown")
 
