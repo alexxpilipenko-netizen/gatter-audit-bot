@@ -46,7 +46,7 @@ ALLOWED_USER_IDS = parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
 
 BRANDS = {
     "Ferrero": ["Nutella", "Ferrero Rocher", "Raffaello", "Kinder", "Tic Tac"],
-    "Mondelez": ["Mondelez", "La Milk", "Bizon", "Kent Boringer", "Korona", "Toffee", "Love is"],
+    "Mondelez": ["Mondelez", "Kent Boringer", "Korona", "Toffee"],
     "Food 2": ["MAY", "Orion", "Well", "Hoppy", "Победа"],
     "Non-Food": ["Lody", "Aerostar", "Energizer", "Wellnax", "Splat"],
 }
