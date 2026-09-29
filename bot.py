@@ -5,6 +5,7 @@ import io
 import asyncio
 import time
 import re
+import threading
 import requests
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
@@ -12,6 +13,12 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+try:
+    # Есть в python-telegram-bot начиная с 20.4. Если на сервере версия
+    # старее — бот запустится в прежнем режиме (по очереди), а не упадёт.
+    from telegram.ext import BaseUpdateProcessor
+except ImportError:
+    BaseUpdateProcessor = None
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -231,32 +238,112 @@ SHEET_HEADER = BASE_HEADER + FOCUS_COLUMNS
 COL = {name: i for i, name in enumerate(SHEET_HEADER)}
 
 
+# Подключение к листу кешируется отдельно в каждом рабочем потоке:
+# раньше перед КАЖДОЙ операцией бот заново получал токен у Google и открывал
+# таблицу (2–3 лишних сетевых запроса). Отдельный кеш на поток — потому что
+# сетевой клиент нельзя безопасно делить между одновременными потоками.
+_ws_cache = threading.local()
+
+
 def _get_worksheet():
-    creds = get_google_creds()
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SHEET_ID)
-    try:
-        ws = sh.worksheet("Аудит")
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title="Аудит", rows=2000, cols=max(30, len(SHEET_HEADER) + 2))
-        ws.append_row(SHEET_HEADER)
+    ws = getattr(_ws_cache, "ws", None)
+    if ws is not None:
+        return ws
+
+    def _open():
+        gc = gspread.authorize(get_google_creds())
+        sh = gc.open_by_key(SHEET_ID)
+        try:
+            return sh.worksheet("Аудит")
+        except gspread.WorksheetNotFound:
+            new_ws = sh.add_worksheet(title="Аудит", rows=2000,
+                                      cols=max(30, len(SHEET_HEADER) + 2))
+            new_ws.append_row(SHEET_HEADER)
+            return new_ws
+
+    ws = with_google_retry(_open)
+    _ws_cache.ws = ws
     return ws
+
+
+def _col_letter(idx: int) -> str:
+    """0 -> A, 25 -> Z, 26 -> AA."""
+    s = ""
+    n = idx + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+
+def _pad(row) -> list:
+    row = list(row)
+    if len(row) < len(SHEET_HEADER):
+        row += [""] * (len(SHEET_HEADER) - len(row))
+    return row
+
+
+def _read_columns(ws, names) -> list:
+    """Читает только нужные столбцы (одним запросом) и возвращает строки
+    полной ширины, где заполнены лишь запрошенные поля. Шапка отброшена.
+    В разы меньше данных, чем get_all_values по всем 27 столбцам."""
+    ranges = []
+    for name in names:
+        letter = _col_letter(COL[name])
+        ranges.append(f"{letter}:{letter}")
+    res = with_google_retry(lambda: ws.batch_get(ranges))
+    cols = [[(r[0] if r else "") for r in vr] for vr in res]
+    n = max((len(c) for c in cols), default=0)
+    rows = []
+    for i in range(1, n):           # 0 — шапка
+        r = [""] * len(SHEET_HEADER)
+        for name, col in zip(names, cols):
+            if i < len(col):
+                r[COL[name]] = col[i]
+        rows.append(r)
+    return rows
+
+
+def _read_day_rows(ws, auditor: str, date_prefix: str) -> list:
+    """Строки аудитора за день. Сначала читаем два узких столбца (дата и
+    аудитор), находим диапазон нужных строк и только его забираем целиком —
+    вместо чтения всего листа."""
+    d_letter = _col_letter(COL["Дата"])
+    a_letter = _col_letter(COL["Аудитор"])
+    res = with_google_retry(
+        lambda: ws.batch_get([f"{d_letter}:{d_letter}", f"{a_letter}:{a_letter}"]))
+    dates = [(r[0] if r else "") for r in res[0]]
+    auds = [(r[0] if r else "") for r in res[1]] if len(res) > 1 else []
+
+    idx = [i for i in range(1, len(dates))
+           if dates[i].startswith(date_prefix)
+           and i < len(auds) and auds[i] == auditor]
+    if not idx:
+        return []
+
+    first, last = min(idx) + 1, max(idx) + 1      # номера строк в листе, с 1
+    last_col = _col_letter(len(SHEET_HEADER) - 1)
+    block = with_google_retry(lambda: ws.get(f"A{first}:{last_col}{last}"))
+    out = []
+    for r in block:
+        r = _pad(r)
+        if r[COL["Аудитор"]] == auditor and r[COL["Дата"]].startswith(date_prefix):
+            out.append(r)
+    return out
 
 
 def get_primary_without_repeat(city: str):
     """Первичные аудиты по городу, у которых ещё нет повторного.
     Возвращает список (visit_id, tt_name, date, auditor)."""
     ws = _get_worksheet()
-    all_rows = with_google_retry(lambda: ws.get_all_values())
-    if not all_rows or len(all_rows) < 2:
+    data = _read_columns(ws, ["ID визита", "Дата", "Аудитор", "Город",
+                              "Название ТТ", "Тип аудита", "Связан с визитом"])
+    if not data:
         return []
-    data = all_rows[1:]
 
     primary = {}
     repeated_links = set()
     for r in data:
-        if len(r) < len(SHEET_HEADER):
-            r = r + [""] * (len(SHEET_HEADER) - len(r))
         vid = r[COL["ID визита"]]
         rcity = r[COL["Город"]]
         atype = r[COL["Тип аудита"]]
@@ -326,18 +413,7 @@ def compute_day_stats(auditor: str, date_prefix: str) -> str:
     (date_prefix — 'ДД.ММ.ГГГГ'). Возвращает готовый текст итога дня."""
     from collections import Counter, defaultdict
     ws = _get_worksheet()
-    all_rows = with_google_retry(lambda: ws.get_all_values())
-    if not all_rows or len(all_rows) < 2:
-        return "За сегодня нет сохранённых аудитов."
-    data = all_rows[1:]
-
-    # строки этого аудитора за эту дату
-    day = []
-    for r in data:
-        if len(r) < len(SHEET_HEADER):
-            r = r + [""] * (len(SHEET_HEADER) - len(r))
-        if r[COL["Аудитор"]] == auditor and r[COL["Дата"]].startswith(date_prefix):
-            day.append(r)
+    day = _read_day_rows(ws, auditor, date_prefix)
     if not day:
         return f"За {date_prefix} у вас нет сохранённых аудитов."
 
@@ -719,7 +795,7 @@ async def repeat_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("⏳ Ищу первичные аудиты по городу...",
                                     reply_markup=ReplyKeyboardRemove())
     try:
-        available = get_primary_without_repeat(city)
+        available = await asyncio.to_thread(get_primary_without_repeat, city)
     except Exception as e:
         logger.error(f"Ошибка чтения таблицы: {e}")
         await update.message.reply_text("❌ Не удалось получить список. Попробуйте позже.")
@@ -1347,7 +1423,7 @@ async def finalize_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["photo_url"] = folder_url
 
     try:
-        save_to_sheet(context.user_data)
+        await asyncio.to_thread(save_to_sheet, context.user_data)
     except Exception as e:
         logger.error(f"Ошибка записи в Sheets: {e}")
         await update.message.reply_text(
@@ -1394,7 +1470,7 @@ async def day_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%d.%m.%Y")
     await update.message.reply_text("⏳ Считаю итог дня...")
     try:
-        text = compute_day_stats(auditor, today)
+        text = await asyncio.to_thread(compute_day_stats, auditor, today)
     except Exception as e:
         logger.error(f"Ошибка расчёта итога дня: {e}")
         await update.message.reply_text("❌ Не удалось посчитать итог. Попробуйте позже.")
@@ -1411,9 +1487,44 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 
+# ─── ОБРАБОТКА ОБНОВЛЕНИЙ ────────────────────────────────────────────────────
+# По умолчанию python-telegram-bot обрабатывает ВСЕ сообщения строго по одному:
+# пока один аудитор сохраняет визит, нажатия остальных стоят в очереди.
+# Здесь разные пользователи обслуживаются параллельно, а сообщения ОДНОГО
+# пользователя — строго по очереди. Последнее важно: аудиторы жмут «готово»
+# по нескольку раз, и без очереди визит записался бы в таблицу дважды.
+if BaseUpdateProcessor is not None:
+    class PerUserUpdateProcessor(BaseUpdateProcessor):
+        def __init__(self, max_concurrent_updates: int = 64):
+            super().__init__(max_concurrent_updates)
+            self._locks = {}
+
+        async def do_process_update(self, update, coroutine):
+            user = getattr(update, "effective_user", None)
+            key = user.id if user else 0
+            lock = self._locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                await coroutine
+
+        async def initialize(self):
+            pass
+
+        async def shutdown(self):
+            pass
+else:
+    PerUserUpdateProcessor = None
+
+
 # ─── MAIN ───────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if PerUserUpdateProcessor is not None:
+        builder = builder.concurrent_updates(PerUserUpdateProcessor(64))
+        logger.info("Режим обработки: параллельно между пользователями")
+    else:
+        logger.warning("Старая версия python-telegram-bot — обработка по очереди. "
+                       "Обновите библиотеку до 20.4+")
+    app = builder.build()
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
